@@ -102,7 +102,9 @@ impl Tray {
         self.added = false;
     }
 
-    /// Show the right-click menu at the cursor; returns the chosen id.
+        /// Show the right-click menu at the cursor; returns the chosen id.
+    /// The text-display switcher was intentionally omitted (屏蔽): the app
+    /// renders the phone bubble by default.
     pub fn show_menu(&self) -> Option<usize> {
         unsafe {
             let menu = CreatePopupMenu().unwrap_or(HMENU::default());

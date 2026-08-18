@@ -48,7 +48,7 @@ pub fn bubble_lines(snap: &Snapshot, source: Option<Source>) -> Vec<String> {
             out
         }
         Mode::Failed => {
-            let mut out = vec!["呜…出错了 (._.)".to_string()];
+            let mut out = vec!["出错了!".to_string()];
             for f in &snap.failed {
                 out.push(format!("✗ [{}] {}", f.source.label(), task_label(f)));
             }
@@ -57,8 +57,8 @@ pub fn bubble_lines(snap: &Snapshot, source: Option<Source>) -> Vec<String> {
         // working / thinking: ONE line showing the actual work content —
         // the live text stream (reasoning while thinking, output while
         // working), falling back to the running tool, then a plain label.
-        Mode::Working => single_live_line(snap, source, Mode::Working, None),
-        Mode::Thinking => single_live_line(snap, source, Mode::Thinking, None),
+        Mode::Working => single_live_line(snap, source, Mode::Working, None, MAX_LINE),
+        Mode::Thinking => single_live_line(snap, source, Mode::Thinking, None, MAX_LINE),
         Mode::Done => {
             let mut out = vec!["任务完成啦 🎉".to_string()];
             for d in &snap.done {
@@ -141,8 +141,26 @@ pub fn live_stream(snap: &Snapshot, source: Option<Source>, mode: Mode) -> Optio
 /// `reveal=None` behaves exactly like [`bubble_lines`].
 pub fn bubble_lines_reveal(snap: &Snapshot, source: Option<Source>, reveal: Option<usize>) -> Vec<String> {
     match snap.mode {
-        Mode::Working => single_live_line(snap, source, Mode::Working, reveal),
-        Mode::Thinking => single_live_line(snap, source, Mode::Thinking, reveal),
+        Mode::Working => single_live_line(snap, source, Mode::Working, reveal, MAX_LINE),
+        Mode::Thinking => single_live_line(snap, source, Mode::Thinking, reveal, MAX_LINE),
+        _ => bubble_lines(snap, source),
+    }
+}
+
+/// Behind-the-pet stream lines with a caller-tunable per-line char window:
+/// the same live stream as the bubble, but `max_line` (text.max_chars in
+/// config) can be far larger than [`MAX_LINE`], so a long DSH response keeps
+/// much more of itself visible instead of shrinking to the last 120 chars.
+/// Non-streaming states fall back to [`bubble_lines`] (those are short).
+pub fn stream_lines(
+    snap: &Snapshot,
+    source: Option<Source>,
+    reveal: Option<usize>,
+    max_line: usize,
+) -> Vec<String> {
+    match snap.mode {
+        Mode::Working => single_live_line(snap, source, Mode::Working, reveal, max_line),
+        Mode::Thinking => single_live_line(snap, source, Mode::Thinking, reveal, max_line),
         _ => bubble_lines(snap, source),
     }
 }
@@ -150,7 +168,7 @@ pub fn bubble_lines_reveal(snap: &Snapshot, source: Option<Source>, reveal: Opti
 /// Single-line bubble for the active work states (plan: show the real work
 /// content, e.g. the reasoning stream while thinking; one line at a time).
 /// With `reveal`, the streamed text appears progressively (逐字出现).
-fn single_live_line(snap: &Snapshot, source: Option<Source>, mode: Mode, reveal: Option<usize>) -> Vec<String> {
+fn single_live_line(snap: &Snapshot, source: Option<Source>, mode: Mode, reveal: Option<usize>, max_line: usize) -> Vec<String> {
     let src = source.unwrap_or(Source::Dsh);
     let tag = format!("[{}] ", src.label());
     let Some(w) = pick_session(snap, source, mode) else {
@@ -163,25 +181,27 @@ fn single_live_line(snap: &Snapshot, source: Option<Source>, mode: Mode, reveal:
         if let Some(t) = &w.tool {
             match &w.tool_args {
                 Some(args) if !args.is_empty() => {
-                    format!("⚙ {t}: {}", truncate_tail(args, MAX_LINE - 24))
+                    format!("⚙ {t}: {}", truncate_tail(args, max_line.saturating_sub(24)))
                 }
                 _ => format!("⚙ 正在执行: {t}"),
             }
         } else {
-            live_reveal(w, true, reveal)
+            live_reveal(w, true, reveal, max_line)
         }
     } else {
-        live_reveal(w, false, reveal)
+        live_reveal(w, false, reveal, max_line)
     };
     vec![format!("{tag}{content}")]
 }
 
 /// Render the live stream of a session (working prefers 💬 text, thinking
-/// prefers 🧠 reasoning), revealing at most `reveal` chars when given.
-fn live_reveal(w: &SessionInfo, prefer_text: bool, reveal: Option<usize>) -> String {
+/// prefers 🧠 reasoning), revealing at most `reveal` chars when given. Keep
+/// at most the last `max_line` chars visible so long streams tail-scroll
+/// instead of freezing a stale head.
+fn live_reveal(w: &SessionInfo, prefer_text: bool, reveal: Option<usize>, max_line: usize) -> String {
     let pick = |s: &str| match reveal {
-        Some(r) if r < s.chars().count() => reveal_tail(s, r, MAX_LINE),
-        _ => truncate_tail(s, MAX_LINE),
+        Some(r) if r < s.chars().count() => reveal_tail(s, r, max_line),
+        _ => truncate_tail(s, max_line),
     };
     if prefer_text {
         if !w.live.text.is_empty() {
@@ -542,6 +562,33 @@ mod tests {
         // does NOT contain the chars after the reveal point (all identical
         // here, so verify the ellipsis is present and length is capped)
         assert!(l[0].chars().count() < 200);
+    }
+
+    #[test]
+    fn stream_lines_wide_window_keeps_more_than_bubble() {
+        // a 300-char stream: the behind-the-pet window (max_chars) keeps all
+        // of it, while the bubble window (MAX_LINE=120) tail-truncates
+        let mut s = snap(Mode::Thinking);
+        let long: String = "字".repeat(300);
+        s.thinking.push(SessionInfo {
+            session_id: "s1".into(),
+            source: Source::Dsh,
+            title: "t".into(),
+            tool: None,
+            tool_args: None,
+            task: None,
+            todos: vec![],
+            live: LiveText { reasoning: long.clone(), text: String::new(), tool_name: None },
+        });
+        let b = bubble_lines(&s, Some(Source::Dsh));
+        let w = stream_lines(&s, Some(Source::Dsh), None, 300);
+        // the behind-the-pet window keeps the full 300 chars (no ellipsis),
+        // the bubble window tail-truncates to 120 and adds "…", so it is
+        // visibly shorter
+        let tag_len = "[DSH] 🧠 ".chars().count();
+        assert_eq!(w[0].chars().count() - tag_len, 300);
+        assert!(w[0].chars().count() > b[0].chars().count());
+        assert!(!w[0].contains('…')); // nothing dropped yet
     }
 
     #[test]

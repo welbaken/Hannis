@@ -22,6 +22,7 @@ pub struct Config {
     pub fade: FadeConfig,
     pub opacity: OpacityConfig,
     pub bubble: BubbleConfig,
+    pub text: TextConfig,
     pub windows: WindowConfig,
     pub autostart: bool,
 }
@@ -142,6 +143,58 @@ impl Default for BubbleConfig {
     }
 }
 
+/// "Behind the pet" text stream styling. The phone bubble stays available:
+/// `mode` picks which renderer the GUI uses ("bubble" = original phone
+/// screen; "behind" = plain outlined text drawn directly in the transparent
+/// window behind the pet sprite, occluded where the pet covers it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextConfig {
+    /// "bubble" | "behind".
+    pub mode: String,
+    /// "behind" mode glyph fill color, "#RRGGBB" (black text; the white
+    /// outline makes it read on any desktop background).
+    pub fill_color: String,
+    /// "behind" mode glyph outline (勾边) color, "#RRGGBB".
+    pub outline_color: String,
+    /// "behind" mode outline thickness in px (1-3; 1 gives the classic
+    /// subtitle halo, 2+ a thicker comic-style stroke).
+    pub outline_width: u32,
+    /// "behind" mode maximum visible lines before truncation with "…".
+    pub max_lines: usize,
+    /// "behind" mode per-stream char window: how many characters of the live
+    /// text stay visible (the bubble keeps only 120). Larger = a long DSH
+    /// response fills from head down to the feet before the front scrolls off.
+    pub max_chars: usize,
+}
+
+impl Default for TextConfig {
+    fn default() -> Self {
+        TextConfig {
+            mode: "bubble".into(),
+            fill_color: "#000000".into(),
+            outline_color: "#FFFFFF".into(),
+            outline_width: 1,
+            max_lines: 8,
+            max_chars: 1200,
+        }
+    }
+}
+
+/// Parse "#RRGGBB" into (r, g, b). Returns None for anything else so the
+/// GUI can fall back to the default palette instead of breaking.
+pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&s[0..2], 16).ok()?,
+        u8::from_str_radix(&s[2..4], 16).ok()?,
+        u8::from_str_radix(&s[4..6], 16).ok()?,
+    ))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
@@ -192,6 +245,7 @@ impl Default for Config {
                 font_scale: 1.0,
                 type_cps: 90,
             },
+            text: TextConfig::default(),
             windows: WindowConfig { done_sec: 10, fail_sec: 10, celebrate_sec: 4 },
             autostart: false,
         }
@@ -296,9 +350,30 @@ mod tests {
         assert_eq!(c2.bubble.type_cps, 90);
         assert!((c2.bubble.font_scale - 1.0).abs() < 1e-6);
         assert_eq!(c2.windows.done_sec, 10);
+        // text section defaults to the phone bubble renderer
+        assert_eq!(c2.text.mode, "bubble");
+        assert_eq!(c2.text.outline_width, 1);
+        assert_eq!(c2.text.max_chars, 1200);
         // missing type_cps in an old config falls back to the default
         let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
         assert_eq!(old.bubble.type_cps, 90);
+        // old configs without a text section must not break: bubble by default
+        let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
+        assert_eq!(old.text.mode, "bubble");
+        // explicit opt-out to the original bubble renderer survives
+        let b: Config = serde_json::from_str(r#"{"text":{"mode":"bubble"}}"#).unwrap();
+        assert_eq!(b.text.mode, "bubble");
+    }
+
+    #[test]
+    fn hex_color_parse() {
+        assert_eq!(parse_hex_color("#FFFFFF"), Some((255, 255, 255)));
+        assert_eq!(parse_hex_color("161616"), Some((0x16, 0x16, 0x16)));
+        assert_eq!(parse_hex_color("#123456"), Some((0x12, 0x34, 0x56)));
+        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color("red"), None);
+        assert_eq!(parse_hex_color("#FFFFF"), None);
+        assert_eq!(parse_hex_color("#GGGGGG"), None);
     }
 
     #[test]

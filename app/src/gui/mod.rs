@@ -4,6 +4,7 @@
 
 pub mod bubble;
 pub mod icon;
+pub mod plaintext;
 pub mod render;
 pub mod tray;
 pub mod window;
@@ -100,6 +101,8 @@ pub struct App {
     pub comp: render::Compositor,
     pub bubble: bubble::Bubble,
     pub bubble_lines: Vec<String>,
+    /// "Behind the pet" text stream overlay (config `text.mode == "behind"`).
+    pub text_overlay: plaintext::TextOverlay,
     /// Typewriter reveal cursor: (session_id, stream kind, chars revealed).
     pub reveal: Option<(String, u8, f32)>,
     pub last_interaction: Instant,
@@ -208,8 +211,8 @@ pub fn run() {
     let celebrate_ms = cfg.windows.celebrate_sec * 1000;
     let font_scale = cfg.bubble.font_scale;
     let scale = cfg.display.scale.clamp(0.25, 2.0);
-    let w = ((576.0 + WINDOW_EXTRA_W as f32) * scale) as i32;
-    let h = (736.0 * scale) as i32;
+    let w = ((800.0 + WINDOW_EXTRA_W as f32) * scale) as i32;
+    let h = (800.0 * scale) as i32;
     let (sx, sy) = screen_size();
     let x = (sx - w - RIGHT_MARGIN).max(0);
     let y = (sy - h - 80).max(0);
@@ -232,6 +235,7 @@ pub fn run() {
         comp: render::Compositor::new(HWND::default(), 1.0),
         bubble: bubble::Bubble::default(),
         bubble_lines: Vec::new(),
+        text_overlay: plaintext::TextOverlay::default(),
         reveal: None,
         last_interaction: Instant::now(),
         fade_alpha: 1.0,
@@ -375,8 +379,8 @@ impl App {
         let snap = self.pet.snapshot();
         self.base_mode = snap.mode;
 
-        // 3) effective mode (drag overlay)
-        let effective = if self.dragging { Mode::Move } else { self.base_mode };
+        // 3) effective mode (drag overlay: move animation only for idle)
+        let effective = self.effective_mode();
         if effective != self.mode {
             self.switch_mode(effective);
         }
@@ -482,9 +486,14 @@ impl App {
             self.spawn_load(self.mode.asset());
         }
 
-        // 6) bubble text: hidden while resting or fully disconnected
+        // 6) text: hidden while resting or fully disconnected. The "behind"
+        //    renderer shows a much wider live window (text.max_chars) than
+        //    the phone bubble (fixed 120 chars), so long DSH responses keep
+        //    scrolling from head down toward the feet instead of shrinking
+        //    to the last 120 chars.
         let sel = self.pet.select_bubble_source();
         let type_cps = self.cfg.bubble.type_cps;
+        let using_behind = self.cfg.text.mode == "behind";
         let lines = if matches!(effective, Mode::Idle | Mode::Offline | Mode::Move) {
             Vec::new()
         } else if type_cps > 0 && matches!(effective, Mode::Thinking | Mode::Working) {
@@ -512,10 +521,18 @@ impl App {
                 }
                 _ => None,
             };
-            bubble_text::bubble_lines_reveal(&snap, sel, pos)
+            if using_behind {
+                bubble_text::stream_lines(&snap, sel, pos, self.cfg.text.max_chars)
+            } else {
+                bubble_text::bubble_lines_reveal(&snap, sel, pos)
+            }
         } else {
             self.reveal = None;
-            bubble_text::bubble_lines(&snap, sel)
+            if using_behind {
+                bubble_text::stream_lines(&snap, sel, None, self.cfg.text.max_chars)
+            } else {
+                bubble_text::bubble_lines(&snap, sel)
+            }
         };
         if lines != self.bubble_lines {
             self.bubble_lines = lines;
@@ -541,7 +558,7 @@ impl App {
             (f.w, f.h)
         } else {
             let s = self.cfg.display.scale.clamp(0.25, 2.0);
-            ((576.0 * s) as u32, (736.0 * s) as u32)
+            ((800.0 * s) as u32, (800.0 * s) as u32)
         }
     }
 
@@ -706,6 +723,33 @@ impl App {
         let pet_y = 0i32;
         let alpha = self.fade_alpha * self.cfg.opacity_for(&self.mode);
 
+        // "behind" mode draws the outlined text FIRST; the phone bubble (the
+        // default) is also composited BEFORE the pet sprite, so the enlarged
+        // bubble may be partially occluded by the body — the pet naturally
+        // covers whatever overlaps it (可以被本体遮挡一部分)。
+        let use_behind = self.cfg.text.mode == "behind";
+        if use_behind {
+            self.text_overlay.layout_if_needed(
+                self.bubble_lines.clone(),
+                pet_w,
+                pet_h,
+                pet_x,
+                pet_y,
+                self.cfg.text.max_lines,
+                &self.comp,
+            );
+            self.text_overlay.draw(&mut self.comp, &self.cfg.text);
+        } else {
+            // phone bubble at the pet's top-left; drawn under the pet, the
+            // right/bottom edge may slip behind the sprite
+            if self.bubble.visible() {
+                let dpi = self.comp.dpi_scale();
+                let bx = bubble::scaled(bubble::BUBBLE_MARGIN_X, dpi) as i32;
+                let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
+                self.bubble.draw(&mut self.comp, bx, by);
+            }
+        }
+
         if self.mode == Mode::Offline {
             // static grayscale idle frame once loaded; until then keep the
             // previous animation on screen (grayscale) so nothing vanishes
@@ -738,16 +782,18 @@ impl App {
                 self.comp.draw_frame(a.frame(idx), pet_x, pet_y, alpha, false);
             }
         }
-        let bubble_visible = self.bubble.visible();
-        if bubble_visible {
-            // overlay the phone bubble at the pet's top-left corner; the
-            // bottom edge lands in the pet canvas's transparent area
-            let dpi = self.comp.dpi_scale();
-            let bx = bubble::scaled(bubble::BUBBLE_MARGIN_X, dpi) as i32;
-            let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
-            self.bubble.draw(&mut self.comp, bx, by);
-        }
         self.comp.present();
+    }
+
+    /// Dragging is always allowed (reposition the pet anytime); the MOVE
+    /// animation only plays while dragging a resting (idle) pet — a busy pet
+    /// just slides with its current state animation untouched.
+    fn effective_mode(&self) -> Mode {
+        if self.dragging && self.base_mode == Mode::Idle {
+            Mode::Move
+        } else {
+            self.base_mode
+        }
     }
 
     pub fn on_lbutton_down(&mut self) {

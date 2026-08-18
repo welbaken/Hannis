@@ -36,6 +36,11 @@ fn premul(bg: u8, a: u8) -> u8 {
     ((bg as u32 * a as u32 + 127) / 255) as u8
 }
 
+/// (r, g, b) -> COLORREF (0x00BBGGRR).
+fn colorref(c: (u8, u8, u8)) -> u32 {
+    ((c.2 as u32) << 16) | ((c.1 as u32) << 8) | (c.0 as u32)
+}
+
 impl Compositor {
     pub fn new(hwnd: HWND, font_scale: f32) -> Compositor {
         let screen_dc = unsafe { GetDC(HWND::default()) };
@@ -134,7 +139,9 @@ impl Compositor {
     }
 
     /// Draw one RGBA frame at (x, y) with global alpha and optional grayscale.
-    /// Premultiplies into the BGRA buffer.
+    /// Composites "over" the premultiplied BGRA buffer: opaque sprite pixels
+    /// cover what is underneath (the behind-the-pet text), transparent /
+    /// antialiased pixels keep it — nothing below the sprite is erased.
     pub fn draw_frame(&mut self, f: &Frame, x: i32, y: i32, alpha: f32, grayscale: bool) {
         if f.w == 0 || f.h == 0 {
             return;
@@ -164,11 +171,21 @@ impl Compositor {
                         b = l;
                     }
                     let aa = ((a as f32 * alpha).round() as u32).min(255);
+                    let sa = aa as u32;
+                    let inv = 255 - sa;
                     let d = &mut self.bits_mut()[dst_idx..dst_idx + 4];
-                    d[0] = premul(b as u8, aa as u8);
-                    d[1] = premul(g as u8, aa as u8);
-                    d[2] = premul(r as u8, aa as u8);
-                    d[3] = aa as u8;
+                    let a0 = d[3] as u32;
+                    let out_a = sa + (a0 * inv + 127) / 255;
+                    if out_a > 0 {
+                        // proper "over" composite: opaque pet pixels cover the
+                        // destination (e.g. the behind-the-pet text), while
+                        // transparent / antialiased pixels blend over it —
+                        // nothing below the sprite is erased
+                        d[0] = (premul(b as u8, sa as u8) as u32 + (d[0] as u32 * inv + 127) / 255).min(255) as u8;
+                        d[1] = (premul(g as u8, sa as u8) as u32 + (d[1] as u32 * inv + 127) / 255).min(255) as u8;
+                        d[2] = (premul(r as u8, sa as u8) as u32 + (d[2] as u32 * inv + 127) / 255).min(255) as u8;
+                        d[3] = out_a as u8;
+                    }
                 }
                 src_idx += 4;
                 dst_idx += 4;
@@ -259,9 +276,13 @@ impl Compositor {
     /// in the gray level, and a color-on-black pass yields the premultiplied
     /// glyph color (pixel = coverage * color).
     ///
+    /// `dx`/`dy` shift the drawn glyphs by a few pixels; the shifted copies
+    /// are used to build an expanded coverage mask for the outline halo (and
+    /// GDI clips shifted draws at the DIB bounds, so no buffer overrun).
+    ///
     /// Each line is measured first and drawn with a 2px bottom slack, so the
     /// last line's descenders are never clipped by the area boundary.
-    fn text_pass(&self, color: u32, w: u32, h: u32, lines: &[String]) {
+    fn text_pass(&self, color: u32, w: u32, h: u32, lines: &[String], dx: i32, dy: i32) {
         unsafe {
             let _ = SetBkMode(self.text_dc, TRANSPARENT);
             let _ = SetTextColor(self.text_dc, COLORREF(color)); // 0x00BBGGRR
@@ -279,10 +300,10 @@ impl Compositor {
             let line_h = (mrc.bottom - mrc.top).max(1);
             // draw fully, plus a little slack so the final line is not cut
             let mut rc = RECT {
-                left: 0,
-                top: cy,
-                right: w as i32,
-                bottom: (cy + line_h + 2).min(area_h),
+                left: dx,
+                top: cy + dy,
+                right: w as i32 + dx,
+                bottom: (cy + line_h + 2 + dy).min(area_h),
             };
             let mut text: Vec<u16> = line.encode_utf16().collect();
             unsafe {
@@ -316,7 +337,7 @@ impl Compositor {
 
         // pass 1: coverage mask (white on black); gray level == coverage
         tbits.fill(0);
-        self.text_pass(0xFF_FF_FF, w, h, lines);
+        self.text_pass(0xFF_FF_FF, w, h, lines, 0, 0);
         let mut coverage: Vec<u8> = Vec::with_capacity(tw * th);
         for row in 0..th {
             let mut i = row * tw * 4;
@@ -328,7 +349,7 @@ impl Compositor {
 
         // pass 2: premultiplied glyph color (dark text on black)
         tbits.fill(0);
-        self.text_pass(0x00_26_26_26, w, h, lines);
+        self.text_pass(0x00_26_26_26, w, h, lines, 0, 0);
 
         // composite: out = src + dst * (1 - src_a), both premultiplied
         let x0 = x.max(0);
@@ -358,6 +379,123 @@ impl Compositor {
                 d[1] = (tbits[ti + 1] as u32 + (d[1] as u32 * inv + 127) / 255).min(255) as u8;
                 d[2] = (tbits[ti + 2] as u32 + (d[2] as u32 * inv + 127) / 255).min(255) as u8;
                 d[3] = (a + (d[3] as u32 * inv + 127) / 255).min(255) as u8;
+            }
+        }
+    }
+
+    /// Draw outlined (勾边) text lines inside (x, y, w, h) on top of the
+    /// current buffer — the "behind the pet" renderer: no bubble chrome,
+    /// just glyphs with a hard outline so they stay readable on any
+    /// background (transparent desktop, light or dark apps, the pet body).
+    ///
+    /// Technique: the same two-pass GDI rasterization as [`draw_text`], plus
+    /// an *expanded* coverage mask built by drawing the white glyphs again
+    /// at every integer offset in the `r×r` square ring around the origin
+    /// (8 draws for a 1px outline, 24 for 2px, 48 for 3px). The outline
+    /// color is composited with that expanded coverage, then the fill color
+    /// with the true coverage — the fill covers the glyph interior and the
+    /// halo survives around the edges, with antialiased blends on both sides.
+    pub fn draw_text_outlined(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        lines: &[String],
+        fill: (u8, u8, u8),
+        outline: (u8, u8, u8),
+        outline_w: u32,
+    ) {
+        if w == 0 || h == 0 || lines.is_empty() {
+            return;
+        }
+        let r = outline_w.clamp(1, 3) as i32;
+        // pad the offscreen raster by the halo radius so the outline is
+        // never clipped at the text-rect edges (GDI would clip at the DIB
+        // bounds otherwise)
+        let pw = w + 2 * r as u32;
+        let ph = h + 2 * r as u32;
+        self.ensure_text_dib(pw, ph);
+        let tw = self.text_w as usize;
+        let th = self.text_h as usize;
+        let tbits = unsafe { std::slice::from_raw_parts_mut(self.text_bits, tw * th * 4) };
+
+        // pass 1: EXPANDED coverage mask — the white glyphs drawn once per
+        // square-ring offset, shifted into the padded DIB; the accumulated
+        // gray level at a pixel is the maximum glyph coverage of every
+        // offset copy (they overwrite, and the values are close enough for a
+        // halo mask).
+        tbits.fill(0);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                self.text_pass(0xFF_FF_FF, pw, ph, lines, dx + r, dy + r);
+            }
+        }
+        let mut ocov: Vec<u8> = Vec::with_capacity(tw * th);
+        for row in 0..th {
+            let mut i = row * tw * 4;
+            for _ in 0..tw {
+                ocov.push(tbits[i]); // R channel of the gray pixel
+                i += 4;
+            }
+        }
+
+        // pass 2: true coverage mask (glyph interior + antialiased edge)
+        tbits.fill(0);
+        self.text_pass(0xFF_FF_FF, pw, ph, lines, r, r);
+        let mut fcov: Vec<u8> = Vec::with_capacity(tw * th);
+        for row in 0..th {
+            let mut i = row * tw * 4;
+            for _ in 0..tw {
+                fcov.push(tbits[i]);
+                i += 4;
+            }
+        }
+
+        // pass 3: premultiplied fill color (fill on black)
+        tbits.fill(0);
+        self.text_pass(colorref(fill), pw, ph, lines, r, r);
+
+        // composite: first the outline shade with the expanded coverage,
+        // then the fill with the true coverage ("over" both times)
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + w as i32).min(self.win_w as i32);
+        let y1 = (y + h as i32).min(self.win_h as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let win_w = self.win_w as usize;
+        let bits = self.bits_mut();
+        for row in y0..y1 {
+            let trow = (row - y) as usize + r as usize;
+            let drow = row as usize;
+            for col in x0..x1 {
+                let tcol = (col - x) as usize + r as usize;
+                let ci = trow * tw + tcol;
+                let oa = ocov[ci] as u32;
+                if oa == 0 {
+                    continue;
+                }
+                let di = (drow * win_w + col as usize) * 4;
+                let d = &mut bits[di..di + 4];
+                let inv_o = 255 - oa;
+                d[0] = (premul(outline.2, oa as u8) as u32 + (d[0] as u32 * inv_o + 127) / 255).min(255) as u8;
+                d[1] = (premul(outline.1, oa as u8) as u32 + (d[1] as u32 * inv_o + 127) / 255).min(255) as u8;
+                d[2] = (premul(outline.0, oa as u8) as u32 + (d[2] as u32 * inv_o + 127) / 255).min(255) as u8;
+                d[3] = (oa + (d[3] as u32 * inv_o + 127) / 255).min(255) as u8;
+                let fa = fcov[ci] as u32;
+                if fa > 0 {
+                    let inv_f = 255 - fa;
+                    let ti = ci * 4;
+                    d[0] = (tbits[ti] as u32 + (d[0] as u32 * inv_f + 127) / 255).min(255) as u8;
+                    d[1] = (tbits[ti + 1] as u32 + (d[1] as u32 * inv_f + 127) / 255).min(255) as u8;
+                    d[2] = (tbits[ti + 2] as u32 + (d[2] as u32 * inv_f + 127) / 255).min(255) as u8;
+                    d[3] = (fa + (d[3] as u32 * inv_f + 127) / 255).min(255) as u8;
+                }
             }
         }
     }

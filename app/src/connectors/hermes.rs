@@ -284,6 +284,13 @@ impl HermesConnector {
             return Ok(());
         }
         let new_msg = id != p.last_msg_id;
+        // Capture the previous snapshot BEFORE overwriting: the streaming
+        // delta below must diff against the OLD text/reasoning, not the one
+        // we are about to store (previous code overwrote first, so same-id
+        // growing rows always produced an empty delta and reasoning/text
+        // streaming froze at the first snapshot).
+        let prev_t = p.last_content.clone().unwrap_or_default();
+        let prev_r = p.last_reasoning.clone().unwrap_or_default();
         p.last_msg_id = id;
         p.last_content = Some(text.clone());
         p.last_reasoning = Some(reasoning_text.clone());
@@ -344,10 +351,8 @@ impl HermesConnector {
         }
         if !new_msg {
             // same id, content grew (streaming write): emit only the delta
-            let prev_t = p.last_content.as_deref().unwrap_or("");
-            let prev_r = p.last_reasoning.as_deref().unwrap_or("");
-            let dtext = text.strip_prefix(prev_t).unwrap_or(&text).to_string();
-            let dreason = reasoning_text.strip_prefix(prev_r).unwrap_or(&reasoning_text).to_string();
+            let dtext = text.strip_prefix(&prev_t).unwrap_or(&text).to_string();
+            let dreason = reasoning_text.strip_prefix(&prev_r).unwrap_or(&reasoning_text).to_string();
             if !dtext.is_empty() || !dreason.is_empty() {
                 evs.push(StateEvent::LiveText {
                     source: Source::Hermes,
@@ -480,6 +485,53 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[test]
+    fn reasoning_streaming_delta_on_same_message() {
+        // regression: a growing message row (same id) must emit the delta of
+        // both text and reasoning, otherwise Hermes thinking freezes at the
+        // first snapshot (often empty) and is never shown
+        let (_td, conn) = tmp_db();
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, started_at, last_active) VALUES ('h1','t','cli',?1,?1)",
+            [now_s],
+        )
+        .unwrap();
+        let c = HermesConnector { db_path: PathBuf::new(), poll_ms_active: 1000, poll_ms_idle: 2000 };
+        let mut prev = HashMap::new();
+        let mut any = false;
+        let _ = c.poll_once(&conn, &mut prev, &mut any).unwrap();
+
+        // first snapshot: reasoning empty, only a little text
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, reasoning_content, timestamp) VALUES ('h1','assistant','开头','',?1)",
+            [now_s],
+        )
+        .unwrap();
+        let mut any = false;
+        let evs1 = c.poll_once(&conn, &mut prev, &mut any).unwrap();
+        assert!(evs1.iter().any(|e| matches!(e, StateEvent::LiveText { reasoning: None, text: Some(t), .. } if t == "开头")));
+
+        // same row grows: reasoning appears + text extends -> delta emitted
+        conn.execute(
+            "UPDATE messages SET reasoning_content='思考中', content='开头后续' WHERE session_id='h1'",
+            [],
+        )
+        .unwrap();
+        let mut any = false;
+        let evs2 = c.poll_once(&conn, &mut prev, &mut any).unwrap();
+        assert!(evs2.iter().any(|e| matches!(e, StateEvent::LiveText { reasoning: Some(r), text: Some(t), .. }
+            if r == "思考中" && t == "后续")));
+
+        // unchanged -> no event
+        let mut any = false;
+        let evs3 = c.poll_once(&conn, &mut prev, &mut any).unwrap();
+        assert!(!evs3.iter().any(|e| matches!(e, StateEvent::LiveText { .. })));
     }
 
     #[test]

@@ -64,10 +64,24 @@ impl Animation {
 }
 
 /// Load an animation for `state` from `resource_dir`, following plan §11:
-/// if resource/<state>/manifest.json exists, load split PNG frames;
-/// otherwise decode <state>.webp directly. Frames are downscaled to
-/// `scale` (1.0 = native).
+/// 1) sprite sheet `resource/<state>.sheet.{png,json}` (single-file decode,
+///    zero per-frame decode cost at startup);
+/// 2) legacy split frames `resource/<state>/manifest.json` + frame_%03d.png;
+/// 3) plain `<state>.webp`. Frames are downscaled to `scale` (1.0 = native).
 pub fn load_animation(resource_dir: &Path, state: &str, scale: f32, use_split: &str) -> std::io::Result<Animation> {
+    let sheet_path = resource_dir.join(format!("{state}.sheet.json"));
+    let sheet_ok = matches!(use_split, "true") || (matches!(use_split, "auto") && sheet_path.exists());
+    if sheet_ok {
+        if let Ok(anim) = load_sheet(resource_dir, state, scale) {
+            return Ok(anim);
+        }
+        if matches!(use_split, "true") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("split frames requested but sheet load failed for {state}"),
+            ));
+        }
+    }
     let state_dir = resource_dir.join(state);
     let manifest_path = state_dir.join("manifest.json");
     let split_ok = matches!(use_split, "true") || (matches!(use_split, "auto") && manifest_path.exists());
@@ -86,23 +100,34 @@ pub fn load_animation(resource_dir: &Path, state: &str, scale: f32, use_split: &
 }
 
 /// Load the optional separate loop animation for `state` (plan: play the
-/// action webp once, then loop `<state>_loop.webp`). Looks for split frames
-/// in `resource/<state>_loop/` first, then the webp file. Returns None when
-/// neither exists (caller falls back to tail-looping the action).
+/// action webp once, then loop `<state>_loop.webp`). Looks for the sprite
+/// sheet `resource/<state>_loop.sheet.{png,json}` first, then legacy split
+/// frames in `resource/<state>_loop/`, then the webp file. Returns None when
+/// none exists (caller falls back to tail-looping the action).
 pub fn load_loop_animation(
     resource_dir: &Path,
     state: &str,
     scale: f32,
     use_split: &str,
 ) -> Option<Animation> {
-    let split_dir = resource_dir.join(format!("{state}_loop"));
-    let split_ok = matches!(use_split, "true")
-        || (matches!(use_split, "auto") && split_dir.join("manifest.json").exists());
-    let mut anim = if split_ok {
-        load_split(&split_dir, scale).ok()
-    } else {
-        None
-    };
+    let mut anim = None;
+    // 1) sprite sheet
+    let sheet_path = resource_dir.join(format!("{state}_loop.sheet.json"));
+    let sheet_ok = matches!(use_split, "true")
+        || (matches!(use_split, "auto") && sheet_path.exists());
+    if sheet_ok {
+        anim = load_sheet(resource_dir, &format!("{state}_loop"), scale).ok();
+    }
+    // 2) legacy split frames
+    if anim.is_none() {
+        let split_dir = resource_dir.join(format!("{state}_loop"));
+        let split_ok = matches!(use_split, "true")
+            || (matches!(use_split, "auto") && split_dir.join("manifest.json").exists());
+        if split_ok {
+            anim = load_split(&split_dir, scale).ok();
+        }
+    }
+    // 3) webp
     if anim.is_none() {
         let path = resource_dir.join(format!("{state}_loop.webp"));
         if path.exists() {
@@ -186,6 +211,72 @@ pub struct Manifest {
     pub frame_count: usize,
     #[serde(default)]
     pub durations_ms: Vec<u32>,
+    /// Sprite-sheet layout: frames per row (1 = single column / legacy split).
+    #[serde(default)]
+    pub frames_per_row: usize,
+}
+
+/// Load frames from a sprite sheet: resource/<state>.sheet.png + .sheet.json.
+/// Frames are laid out row-major in a grid of `frames_per_row` columns,
+/// each cell `<width>x<height>` (see tools/split_webp.py / make_sheets.js).
+pub fn load_sheet(resource_dir: &Path, state: &str, scale: f32) -> std::io::Result<Animation> {
+    let json_path = resource_dir.join(format!("{state}.sheet.json"));
+    let png_path = resource_dir.join(format!("{state}.sheet.png"));
+    let manifest: Manifest = {
+        let s = std::fs::read_to_string(&json_path)?;
+        serde_json::from_str(&s)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+    };
+    let n = if manifest.frame_count > 0 {
+        manifest.frame_count
+    } else {
+        manifest.durations_ms.len()
+    };
+    let (fw, fh) = (manifest.width, manifest.height);
+    let fpr = manifest.frames_per_row.max(1) as u32;
+    if fw == 0 || fh == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad sheet cell size {fw}x{fh} in {json_path:?}"),
+        ));
+    }
+    let rows = (n as u32 + fpr - 1) / fpr;
+    let mut img = image::open(&png_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{png_path:?}: {e}")))?
+        .to_rgba8();
+    if img.width() < fpr * fw || img.height() < rows * fh {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "sheet too small: {}x{} < needed {}x{}",
+                img.width(),
+                img.height(),
+                fpr * fw,
+                rows * fh
+            ),
+        ));
+    }
+    let (w, h) = scaled_dims(fw, fh, scale);
+    let mut frames = Vec::with_capacity(n);
+    let mut durations_ms = manifest.durations_ms.clone();
+    for i in 0..n {
+        let iu = i as u32;
+        let x = (iu % fpr) * fw;
+        let y = (iu / fpr) * fh;
+        let cell = image::imageops::crop(&mut img, x, y, fw, fh).to_image();
+        frames.push(if w == fw && h == fh {
+            Frame { w, h, rgba: cell.into_raw() }
+        } else {
+            downscale(&cell, w, h)
+        });
+        if durations_ms.len() < n {
+            durations_ms.push(42);
+        }
+    }
+    if frames.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no frames"));
+    }
+    Ok(Animation { name: state.to_string(), frames, durations_ms })
 }
 
 /// Load split frames: resource/<state>/frame_%03d.png + manifest.json.
@@ -427,6 +518,54 @@ mod tests {
     }
 
     #[test]
+    fn sheet_roundtrip_matches_webp() {
+        // sheet loader must produce byte-identical frames to the webp loader
+        // (both decoders should agree on straight RGBA).
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resource");
+        if !dir.join("idle.sheet.json").exists() {
+            eprintln!("sheet fixtures missing, skipping");
+            return;
+        }
+        let a_native = load_webp(&dir.join("idle.webp"), 1.0).expect("decode idle.webp");
+        let a_half = load_webp(&dir.join("idle.webp"), 0.5).expect("decode idle.webp");
+        let b = load_sheet(&dir, "idle", 1.0).expect("load sheet");
+        assert_eq!(b.frame_count(), a_native.frame_count());
+        assert_eq!(b.durations_ms, a_native.durations_ms);
+        // sheet PNG is lossless (generator uses palette:false); the only
+        // remaining variance vs the webp reference is decoder rounding
+        // (sharp libwebp vs Rust image-webp, typically ±1/255 per channel).
+        let stats = |x: &[u8], y: &[u8]| -> (u32, u32) {
+            let (mut n, mut maxd) = (0u32, 0u32);
+            for (a, b) in x.iter().zip(y.iter()) {
+                let d = (*a as i32 - *b as i32).unsigned_abs();
+                if d > 0 {
+                    n += 1;
+                    maxd = maxd.max(d);
+                }
+            }
+            (n, maxd)
+        };
+        let (n0, max0) = stats(&b.frame(0).rgba, &a_native.frame(0).rgba);
+        let last = a_native.frame_count() - 1;
+        let (nl, maxl) = stats(&b.frame(last).rgba, &a_native.frame(last).rgba);
+        eprintln!("sheet roundtrip: frame0 {n0} diff bytes (max {max0}), frame{last} {nl} diff bytes (max {maxl})");
+        assert!(max0 <= 2 && maxl <= 2, "unexpected large divergence");
+        assert!(n0 < 8192 && nl < 8192, "too many divergent bytes");
+        let bh = load_sheet(&dir, "idle", 0.5).expect("load scaled sheet");
+        assert_eq!(bh.frame_count(), a_half.frame_count());
+        let (nh, maxh) = stats(&bh.frame(0).rgba, &a_half.frame(0).rgba);
+        eprintln!("scaled sheet roundtrip: {nh} diff bytes (max {maxh})");
+        assert!(maxh <= 2 && nh < 8192);
+        // loop sheet is picked up by the loop loader and renamed to the state
+        assert!(load_loop_animation(&dir, "idle", 0.5, "auto").is_none()); // no idle_loop
+        if dir.join("think_loop.sheet.json").exists() {
+            let l = load_loop_animation(&dir, "think", 0.5, "auto").expect("think loop");
+            assert_eq!(l.name, "think");
+            assert!(l.frame_count() > 0);
+        }
+    }
+
+    #[test]
     fn split_roundtrip_matches_webp() {
         // verify the manifest/split-frame loader path end-to-end (plan §11).
         // Expectations derive from the CURRENT asset so a legitimate webp
@@ -445,8 +584,9 @@ mod tests {
             img.save(tmp.join(format!("frame_{i:03}.png"))).unwrap();
         }
         let n = a_native.frame_count();
+        let (fw, fh) = (a_native.frame(0).w, a_native.frame(0).h);
         let manifest = format!(
-            r#"{{"state":"idle","width":576,"height":736,"frame_count":{n},"durations_ms":{},"tail":{{"start":{},"end":{}}}}}"#,
+            r#"{{"state":"idle","width":{fw},"height":{fh},"frame_count":{n},"durations_ms":{},"tail":{{"start":{},"end":{}}}}}"#,
             serde_json::to_string(&a_native.durations_ms).unwrap(),
             n.saturating_sub(24),
             n

@@ -35,6 +35,14 @@ if [ -f "$APP/config.json" ]; then
   cp "$APP/config.json" "$DIST/config.json"
 fi
 
+# 构建期生成 sprite sheet(不进 git;产物在 dist/resource 下,运行期零解码延迟)
+if command -v node >/dev/null 2>&1; then
+  echo "==> 生成 sprite sheet(dist/resource)"
+  node "$ROOT/tools/make_sheets.js" --src "$DIST/resource" || echo "  (sheet 生成失败,运行期将回退 webp)"
+else
+  echo "==> 跳过 sprite sheet(node 不可用,运行期将回退 webp)"
+fi
+
 echo ""
 echo "构建完成: $DIST/Hannis.exe"
 echo "同步到 Windows: ./sync-dist.sh"

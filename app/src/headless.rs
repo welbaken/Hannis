@@ -201,17 +201,18 @@ fn self_test() {
     let dir = Path::new("resource");
     let mut ok = true;
     for name in ["idle", "working", "think", "attention", "done", "fail", "move"] {
-        match dshpet::anim::load_webp(&dir.join(format!("{name}.webp")), 0.5) {
+        // auto: prefers <name>.sheet.*, then legacy split, then <name>.webp
+        match dshpet::anim::load_animation(&dir, name, 0.5, "auto") {
             Ok(a) => {
                 println!(
-                    "  {name}.webp: {} frames, {}ms, tail_start@{}",
+                    "  {name}: {} frames, {}ms, tail_start@{}",
                     a.frame_count(),
                     a.total_ms(),
                     a.tail_start(1000, None)
                 );
             }
             Err(e) => {
-                println!("  {name}.webp: FAIL {e}");
+                println!("  {name}: FAIL {e}");
                 ok = false;
             }
         }

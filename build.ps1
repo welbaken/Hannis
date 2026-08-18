@@ -23,6 +23,15 @@ if (Test-Path "resource") {
     if (Test-Path (Join-Path $dist "resource")) { Remove-Item (Join-Path $dist "resource") -Recurse -Force }
     Copy-Item "resource" $dist -Recurse
 }
+# 构建期生成 sprite sheet(可选优化;失败则运行期回退 webp)
+$sheetSrc = Join-Path $dist "resource"
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    node "tools\make_sheets.js" --src $sheetSrc
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+    python "tools\split_webp.py" --src $sheetSrc
+} else {
+    Write-Warning "node/python 不可用,跳过 sheet 生成(运行期将回退 webp)"
+}
 if (Test-Path "icon.png") {
     Copy-Item "icon.png" $dist -Force
 }

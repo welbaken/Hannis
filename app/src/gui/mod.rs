@@ -486,14 +486,13 @@ impl App {
             self.spawn_load(self.mode.asset());
         }
 
-        // 6) text: hidden while resting or fully disconnected. The "behind"
-        //    renderer shows a much wider live window (text.max_chars) than
-        //    the phone bubble (fixed 120 chars), so long DSH responses keep
-        //    scrolling from head down toward the feet instead of shrinking
-        //    to the last 120 chars.
+        // 6) text: hidden while resting or fully disconnected. Both renderers
+        //    use the wide per-line window (text.max_chars): the phone bubble
+        //    tail-fits it into its enlarged box in bubble::layout, the
+        //    behind-the-pet stream lays it out against the pet box.
         let sel = self.pet.select_bubble_source();
         let type_cps = self.cfg.bubble.type_cps;
-        let using_behind = self.cfg.text.mode == "behind";
+        let max_chars = self.cfg.text.max_chars;
         let lines = if matches!(effective, Mode::Idle | Mode::Offline | Mode::Move) {
             Vec::new()
         } else if type_cps > 0 && matches!(effective, Mode::Thinking | Mode::Working) {
@@ -521,18 +520,10 @@ impl App {
                 }
                 _ => None,
             };
-            if using_behind {
-                bubble_text::stream_lines(&snap, sel, pos, self.cfg.text.max_chars)
-            } else {
-                bubble_text::bubble_lines_reveal(&snap, sel, pos)
-            }
+            bubble_text::stream_lines(&snap, sel, pos, max_chars)
         } else {
             self.reveal = None;
-            if using_behind {
-                bubble_text::stream_lines(&snap, sel, None, self.cfg.text.max_chars)
-            } else {
-                bubble_text::bubble_lines(&snap, sel)
-            }
+            bubble_text::stream_lines(&snap, sel, None, max_chars)
         };
         if lines != self.bubble_lines {
             self.bubble_lines = lines;

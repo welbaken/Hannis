@@ -25,8 +25,6 @@ pub const MIN_BUBBLE_H: u32 = 390;
 /// How transparent the white fill is (0 = invisible, 255 = opaque).
 pub const FILL_ALPHA: u8 = 10;
 
-const MAX_LINE_CHARS: usize = 120;
-
 pub(crate) fn scaled(v: u32, s: f32) -> u32 {
     ((v as f32) * s).round().max(1.0) as u32
 }
@@ -75,13 +73,42 @@ impl Bubble {
         let mut shown = lines;
         let mut text_h = comp.measure_text(text_w, &shown);
         if shown.len() == 1 {
-            // stable height: the streaming single line changes length every
-            // update; allocate a FIXED height (up to 4 rows) so the bubble
-            // never resizes and the pet never jumps
-            let dummy: String = "…".to_string() + &"字".repeat(MAX_LINE_CHARS);
-            let one_row = comp.measure_text(text_w, &["字".to_string()]).max(1);
-            let dummy_h = comp.measure_text(text_w, &[dummy]);
-            text_h = dummy_h.min(one_row * 4).min(max_text_h).max(one_row);
+            // The streaming single line owns the FULL text area (fixed
+            // height -> the bubble never jumps while text streams in) and
+            // its content is TAIL-FITTED: keep the newest chars that fit in
+            // max_text_h, dropping the oldest with a leading "…". This is
+            // what lets the enlarged box actually show the growing stream
+            // instead of a small fixed window.
+            let chars: Vec<char> = shown[0].chars().collect();
+            let n = chars.len();
+            if n > 0 && text_h > max_text_h {
+                // largest suffix (in chars) whose wrapped height fits
+                let mut lo = 1usize;
+                let mut hi = n;
+                let mut keep = n;
+                while lo <= hi {
+                    let mid = (lo + hi) / 2;
+                    let suffix: String = chars[n - mid..].iter().collect();
+                    if comp.measure_text(text_w, &[suffix]) <= max_text_h {
+                        keep = mid;
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                if keep < n {
+                    let mut line = String::from("…");
+                    line.extend(chars[n - keep..].iter());
+                    // the leading ellipsis may push it over by a row; drop
+                    // one more char if needed
+                    if comp.measure_text(text_w, &[line.clone()]) > max_text_h && keep > 1 {
+                        line = String::from("…");
+                        line.extend(chars[n - (keep - 1)..].iter());
+                    }
+                    shown[0] = line;
+                }
+            }
+            text_h = max_text_h; // full box height for the streaming view
         }
         if text_h > max_text_h {
             // drop trailing lines until it fits, then append an ellipsis

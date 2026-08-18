@@ -519,11 +519,11 @@ mod tests {
 
     #[test]
     fn sheet_roundtrip_matches_webp() {
-        // sheet loader must produce byte-identical frames to the webp loader
-        // (both decoders should agree on straight RGBA).
+        // sheet loader must produce frames matching the webp reference decode.
+        // webp 源已从 resource/ 移除后(sheet 为唯一素材),本测试自动跳过。
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resource");
-        if !dir.join("idle.sheet.json").exists() {
-            eprintln!("sheet fixtures missing, skipping");
+        if !dir.join("idle.sheet.json").exists() || !dir.join("idle.webp").exists() {
+            eprintln!("sheet/webp fixtures missing, skipping");
             return;
         }
         let a_native = load_webp(&dir.join("idle.webp"), 1.0).expect("decode idle.webp");

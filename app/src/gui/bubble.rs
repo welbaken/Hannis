@@ -47,9 +47,11 @@ impl Bubble {
         !self.lines.is_empty()
     }
 
-    /// Measure the bubble for `lines`, constrained to the pet frame and a
-    /// max height; truncates overflow with "…". Text wraps at the phone
-    /// width, and total height is capped at MAX_BUBBLE_H / the pet height.
+    /// Measure the bubble for `lines`. The box has a UNIFORM fixed size
+    /// (the enlarged 1.5× phone screen, capped by the pet frame) that never
+    /// changes with the message; the content is laid out inside it — wrapped,
+    /// trailing lines dropped with "…", and a streaming single line is
+    /// tail-fitted (newest chars kept, oldest dropped with a leading "…").
     pub fn layout(&mut self, lines: Vec<String>, pet_w: u32, pet_h: u32, comp: &Compositor) -> bool {
         if lines == self.lines {
             return false;
@@ -64,69 +66,65 @@ impl Bubble {
         let pad_x = scaled(PAD_X, s);
         let pad_top = scaled(PAD_TOP, s);
         let pad_bottom = scaled(PAD_BOTTOM, s);
+        // fixed size regardless of the message
         let min_w = scaled(MIN_BUBBLE_W, s);
-        let max_w = scaled(MAX_BUBBLE_W, s).min(pet_w.max(min_w));
-        let text_w = (max_w - pad_x * 2).max(scaled(72, s));
-        let max_h = scaled(MAX_BUBBLE_H, s).min(pet_h.saturating_sub(scaled(BUBBLE_MARGIN_Y, s)));
-        let max_text_h = max_h.saturating_sub(pad_top + pad_bottom).max(scaled(24, s));
+        let w = scaled(MAX_BUBBLE_W, s).min(pet_w.max(min_w));
+        let h = scaled(MAX_BUBBLE_H, s)
+            .min(pet_h.saturating_sub(scaled(BUBBLE_MARGIN_Y, s)))
+            .max(scaled(MIN_BUBBLE_H, s));
+        let text_w = w.saturating_sub(pad_x * 2).max(scaled(72, s));
+        let text_h = h.saturating_sub(pad_top + pad_bottom).max(scaled(24, s));
 
+        // fit the content into the fixed area without resizing the box
         let mut shown = lines;
-        let mut text_h = comp.measure_text(text_w, &shown);
-        if shown.len() == 1 {
-            // The streaming single line owns the FULL text area (fixed
-            // height -> the bubble never jumps while text streams in) and
-            // its content is TAIL-FITTED: keep the newest chars that fit in
-            // max_text_h, dropping the oldest with a leading "…". This is
-            // what lets the enlarged box actually show the growing stream
-            // instead of a small fixed window.
+        let mut measured = comp.measure_text(text_w, &shown);
+        if shown.len() == 1 && measured > text_h {
+            // streaming single line: TAIL-FIT — keep the newest chars that
+            // fit, drop the oldest with a leading "…"
             let chars: Vec<char> = shown[0].chars().collect();
             let n = chars.len();
-            if n > 0 && text_h > max_text_h {
-                // largest suffix (in chars) whose wrapped height fits
-                let mut lo = 1usize;
-                let mut hi = n;
-                let mut keep = n;
-                while lo <= hi {
-                    let mid = (lo + hi) / 2;
-                    let suffix: String = chars[n - mid..].iter().collect();
-                    if comp.measure_text(text_w, &[suffix]) <= max_text_h {
-                        keep = mid;
-                        lo = mid + 1;
-                    } else {
-                        hi = mid - 1;
-                    }
-                }
-                if keep < n {
-                    let mut line = String::from("…");
-                    line.extend(chars[n - keep..].iter());
-                    // the leading ellipsis may push it over by a row; drop
-                    // one more char if needed
-                    if comp.measure_text(text_w, &[line.clone()]) > max_text_h && keep > 1 {
-                        line = String::from("…");
-                        line.extend(chars[n - (keep - 1)..].iter());
-                    }
-                    shown[0] = line;
+            // largest suffix (in chars) whose wrapped height fits
+            let mut lo = 1usize;
+            let mut hi = n;
+            let mut keep = n;
+            while lo <= hi {
+                let mid = (lo + hi) / 2;
+                let suffix: String = chars[n - mid..].iter().collect();
+                if comp.measure_text(text_w, &[suffix]) <= text_h {
+                    keep = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
                 }
             }
-            text_h = max_text_h; // full box height for the streaming view
+            if keep < n {
+                let mut line = String::from("…");
+                line.extend(chars[n - keep..].iter());
+                // the leading ellipsis may push it over by a row; drop one
+                // more char if needed
+                if comp.measure_text(text_w, &[line.clone()]) > text_h && keep > 1 {
+                    line = String::from("…");
+                    line.extend(chars[n - (keep - 1)..].iter());
+                }
+                shown[0] = line;
+                measured = comp.measure_text(text_w, &shown).min(text_h);
+            }
         }
-        if text_h > max_text_h {
-            // drop trailing lines until it fits, then append an ellipsis
-            while text_h > max_text_h && shown.len() > 1 {
+        if measured > text_h {
+            // multi-line message too tall: drop trailing lines, append "…"
+            while measured > text_h && shown.len() > 1 {
                 shown.pop();
-                text_h = comp.measure_text(text_w, &shown);
+                measured = comp.measure_text(text_w, &shown);
             }
-            if text_h > max_text_h {
-                // a single over-long line: keep it but accept the cap
-                text_h = max_text_h;
+            if measured > text_h {
+                // single over-long line: keep it but accept the clipped cap
             } else {
                 shown.push("…".to_string());
-                text_h = comp.measure_text(text_w, &shown).min(max_text_h);
             }
         }
         self.lines = shown;
-        self.w = (text_w + pad_x * 2).max(min_w);
-        self.h = (text_h + pad_top + pad_bottom).max(scaled(MIN_BUBBLE_H, s));
+        self.w = w;
+        self.h = h;
         true
     }
 

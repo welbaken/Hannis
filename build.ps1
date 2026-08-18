@@ -23,10 +23,10 @@ if (Test-Path "resource") {
     if (Test-Path (Join-Path $dist "resource")) { Remove-Item (Join-Path $dist "resource") -Recurse -Force }
     Copy-Item "resource" $dist -Recurse
 }
-# 构建期生成 sprite sheet(可选优化;失败则运行期回退 webp)
+# 构建期生成/保留 sprite sheet(量化 256 色;resource/ 里更新的 sheet 保留)
 $sheetSrc = Join-Path $dist "resource"
 if (Get-Command node -ErrorAction SilentlyContinue) {
-    node "tools\make_sheets.js" --src $sheetSrc
+    node "tools\make_sheets.js" --src $sheetSrc --keep-newer --palette 256
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
     python "tools\split_webp.py" --src $sheetSrc
 } else {

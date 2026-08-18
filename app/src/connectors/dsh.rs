@@ -566,6 +566,19 @@ impl Default for StreamCtx {
     }
 }
 
+/// Pending-question key for one item of a `question/requested` frame.
+/// The server's `question/resolved` frame carries only the envelope rpcId
+/// (`questionRpcId`), so the key is `rpcId\u{0}itemId` — state.rs clears a
+/// whole request by prefix. Falls back to the bare item id for malformed
+/// frames (envelope without rpcId).
+fn question_pending_id(rpc_id: &str, item_id: &str) -> String {
+    if rpc_id.is_empty() {
+        item_id.to_string()
+    } else {
+        format!("{rpc_id}\u{0}{item_id}")
+    }
+}
+
 /// Parse a `server-request` envelope payload (mux frame).
 /// session/event frames are intentionally NOT handled here: session events
 /// come from the session.history poller (mux does not deliver them to
@@ -633,11 +646,19 @@ fn handle_mux_frame(ctx: &mut StreamCtx, envelope: &str) -> Option<Vec<StateEven
             });
         }
         "question/requested" => {
+            // The server resolves the whole request through the ENVELOPE rpcId
+            // (that same value arrives later as payload.questionRpcId in
+            // `question/resolved`); the questions[] items only carry
+            // model-supplied ids. Key each pending item by
+            // `<rpcId>\u{0}<itemId>` so state.rs can clear the whole request
+            // by prefix; a bare item id would never match the resolved frame
+            // and the pet would stay in attention forever.
+            let rpc_id = v.get("rpcId").and_then(Value::as_str).unwrap_or("").to_string();
             if let Some(qs) = payload["questions"].as_array() {
                 for q in qs {
                     evs.push(StateEvent::QuestionRequested {
                         source: Source::Dsh,
-                        id: q["id"].as_str().unwrap_or("").to_string(),
+                        id: question_pending_id(&rpc_id, q["id"].as_str().unwrap_or("")),
                         session_id: sid.to_string(),
                         text: q["question"].as_str().unwrap_or("").to_string(),
                     });
@@ -707,12 +728,22 @@ mod tests {
         assert!(matches!(&evs[0], StateEvent::ApprovalRequested { id, tool, .. } if id=="a1" && tool=="bash"));
 
         let env = json!({
-            "type":"server-request","rpcId":"r","method":"question/requested",
+            "type":"server-request","rpcId":"r-q1","method":"question/requested",
             "payload":{"type":"question/requested","sessionId":"s1","questions":[{"id":"q1","question":"继续吗?"}]}
         })
         .to_string();
         let evs = handle_mux_frame(&mut ctx, &env).unwrap();
-        assert!(matches!(&evs[0], StateEvent::QuestionRequested { id, text, .. } if id=="q1" && text=="继续吗?"));
+        // pending key is the ENVELOPE rpcId (+ item id), because
+        // question/resolved only carries the rpcId
+        assert!(matches!(&evs[0], StateEvent::QuestionRequested { id, text, .. } if id=="r-q1\u{0}q1" && text=="继续吗?"));
+
+        let env = json!({
+            "type":"server-request","rpcId":"x","method":"question/resolved",
+            "payload":{"type":"question/resolved","sessionId":"s1","questionRpcId":"r-q1","outcome":"answered"}
+        })
+        .to_string();
+        let evs = handle_mux_frame(&mut ctx, &env).unwrap();
+        assert!(matches!(&evs[0], StateEvent::QuestionResolved { id, .. } if id=="r-q1"));
 
         let job = |status: &str| {
             json!({

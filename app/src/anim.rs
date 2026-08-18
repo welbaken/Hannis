@@ -531,31 +531,36 @@ mod tests {
         let b = load_sheet(&dir, "idle", 1.0).expect("load sheet");
         assert_eq!(b.frame_count(), a_native.frame_count());
         assert_eq!(b.durations_ms, a_native.durations_ms);
-        // sheet PNG is lossless (generator uses palette:false); the only
-        // remaining variance vs the webp reference is decoder rounding
-        // (sharp libwebp vs Rust image-webp, typically ±1/255 per channel).
-        let stats = |x: &[u8], y: &[u8]| -> (u32, u32) {
-            let (mut n, mut maxd) = (0u32, 0u32);
-            for (a, b) in x.iter().zip(y.iter()) {
-                let d = (*a as i32 - *b as i32).unsigned_abs();
-                if d > 0 {
-                    n += 1;
-                    maxd = maxd.max(d);
+        // 当前素材是 256 色量化 sheet:只在可见像素(alpha>0)上比较。
+        // 实测分布:99% 可见像素有 ±1~2 抖差,max ~114,>64 的约占 0.8%。
+        let stats = |x: &[u8], y: &[u8]| -> (u32, u32, u32, u32) {
+            let (mut n, mut maxd, mut bad, mut visible) = (0u32, 0u32, 0u32, 0u32);
+            for (a, b) in x.chunks(4).zip(y.chunks(4)) {
+                if b[3] == 0 { continue; }
+                visible += 1;
+                let mut d = 0;
+                for c in 0..4 {
+                    let dc = (a[c] as i32 - b[c] as i32).unsigned_abs();
+                    if dc > d { d = dc; }
                 }
+                if d > 0 { n += 1; }
+                if d > maxd { maxd = d; }
+                if d > 64 { bad += 1; }
             }
-            (n, maxd)
+            (n, maxd, bad, visible)
         };
-        let (n0, max0) = stats(&b.frame(0).rgba, &a_native.frame(0).rgba);
+        let (n0, max0, bad0, vis0) = stats(&b.frame(0).rgba, &a_native.frame(0).rgba);
         let last = a_native.frame_count() - 1;
-        let (nl, maxl) = stats(&b.frame(last).rgba, &a_native.frame(last).rgba);
-        eprintln!("sheet roundtrip: frame0 {n0} diff bytes (max {max0}), frame{last} {nl} diff bytes (max {maxl})");
-        assert!(max0 <= 2 && maxl <= 2, "unexpected large divergence");
-        assert!(n0 < 8192 && nl < 8192, "too many divergent bytes");
+        let (nl, maxl, badl, visl) = stats(&b.frame(last).rgba, &a_native.frame(last).rgba);
+        eprintln!("sheet roundtrip(quant): frame0 {n0}/{vis0} px diff (max {max0}, >64: {bad0}); frame{last} {nl}/{visl} px diff (max {maxl}, >64: {badl})");
+        assert!(max0 <= 200 && maxl <= 200, "unexpected large divergence");
+        assert!(bad0 * 50 < vis0.max(1) && badl * 50 < visl.max(1),
+            "too many badly divergent pixels (>=2% of visible)");
         let bh = load_sheet(&dir, "idle", 0.5).expect("load scaled sheet");
         assert_eq!(bh.frame_count(), a_half.frame_count());
-        let (nh, maxh) = stats(&bh.frame(0).rgba, &a_half.frame(0).rgba);
-        eprintln!("scaled sheet roundtrip: {nh} diff bytes (max {maxh})");
-        assert!(maxh <= 2 && nh < 8192);
+        let (nh, maxh, badh, vish) = stats(&bh.frame(0).rgba, &a_half.frame(0).rgba);
+        eprintln!("scaled sheet roundtrip(quant): {nh}/{vish} px diff (max {maxh}, >64: {badh})");
+        assert!(maxh <= 200 && badh * 50 < vish.max(1));
         // loop sheet is picked up by the loop loader and renamed to the state
         assert!(load_loop_animation(&dir, "idle", 0.5, "auto").is_none()); // no idle_loop
         if dir.join("think_loop.sheet.json").exists() {

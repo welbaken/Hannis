@@ -97,7 +97,7 @@ TodoItem = { content: string, status: 'pending' | 'in_progress' | 'completed' }
 |---|---|---|
 | `approval/requested` | approvalId, sessionId, toolName, reason | 待审批 → attention |
 | `approval/resolved` | approvalId | 审批已决 |
-| `question/requested` | questionRpcId, sessionId, questions[] | 待回答 → attention |
+| `question/requested` | 帧顶层 rpcId(=questionRpcId), sessionId, questions[] | 待回答 → attention |
 | `question/resolved` | questionRpcId | 已回答 |
 | `session/queue` | items[] | 队列长度(可显示"排队的会话") |
 | `session/event` | event(见 §3.4) | 会话事件全量 |

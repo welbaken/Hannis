@@ -432,7 +432,13 @@ impl PetState {
                 );
             }
             StateEvent::QuestionResolved { id, .. } => {
-                self.questions.remove(&id);
+                // Clears a whole request: the exact key (Hermes clarify id,
+                // legacy frames) OR every item the DSH connector keyed under
+                // `<id>\u{0}<itemId>` — `question/resolved` carries only the
+                // request's rpcId, which must not leave sibling items pending
+                // (that would keep the pet in attention forever).
+                let prefix = format!("{id}\u{0}");
+                self.questions.retain(|k, _| k != &id && !k.starts_with(&prefix));
             }
             StateEvent::UserMessage { source, session_id, text } => {
                 let s = self.session_mut(source, &session_id);
@@ -696,6 +702,31 @@ mod tests {
         assert_eq!(p.mode(), Mode::Attention);
         p.apply(StateEvent::ApprovalResolved { source: Source::Dsh, id: "ap1".into() });
         assert_eq!(p.mode(), Mode::Working);
+    }
+
+    #[test]
+    fn question_resolved_clears_whole_request() {
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        // one ask() request with two question items, keyed as the DSH
+        // connector does: `<rpcId>\u{0}<itemId>`
+        p.apply(StateEvent::QuestionRequested {
+            source: Source::Dsh,
+            id: "r1\u{0}q1".into(),
+            session_id: "s1".into(),
+            text: "继续吗?".into(),
+        });
+        p.apply(StateEvent::QuestionRequested {
+            source: Source::Dsh,
+            id: "r1\u{0}q2".into(),
+            session_id: "s1".into(),
+            text: "选哪个?".into(),
+        });
+        assert_eq!(p.mode(), Mode::Attention);
+        // user answers -> question/resolved carries only the request rpcId
+        p.apply(StateEvent::QuestionResolved { source: Source::Dsh, id: "r1".into() });
+        assert_eq!(p.snapshot().pending_questions.len(), 0);
+        assert_eq!(p.mode(), Mode::Thinking); // the running turn is back on top
     }
 
     #[test]

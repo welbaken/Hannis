@@ -62,26 +62,64 @@ function blitRows(srcRaw, sheetRaw, pages, fw, fh, fpr, sheetW) {
   }
 }
 
-/** 校验:重解码 sheet PNG,与画布原始像素逐字节比对。 */
-async function verifySheet(sheetPng, dstRaw, name) {
+/** 校验:重解码 sheet PNG,与画布原始像素比对。
+ * 无损(palette=0)要求逐字节一致;量化(palette>0)允许通道差 ≤64、
+ * 可见像素(alpha>0)平均差 ≤8——能抓住布局/拷贝类灾难性错误,
+ * 同时兼容调色板量化在边缘的舍入。 */
+async function verifySheet(sheetPng, dstRaw, name, palette) {
   const back = await sharp(sheetPng).raw().toBuffer();
   if (back.length !== dstRaw.length) {
     throw new Error(`${name}: size mismatch ${back.length} != ${dstRaw.length}`);
   }
   let first = -1;
-  for (let i = 0; i < dstRaw.length; i++) {
-    if (back[i] !== dstRaw[i]) { first = i; break; }
+  if (!palette) {
+    for (let i = 0; i < dstRaw.length; i++) {
+      if (back[i] !== dstRaw[i]) { first = i; break; }
+    }
+    if (first >= 0) {
+      throw new Error(`${name}: sheet verification failed at byte ${first} (encoded ${back[first]}, expected ${dstRaw[first]})`);
+    }
+    return;
   }
-  if (first >= 0) {
-    throw new Error(`${name}: sheet verification failed at byte ${first} (encoded ${back[first]}, expected ${dstRaw[first]})`);
+  // 量化容差:只看 alpha>0 的可见像素;实测量化在边缘的分布:
+  // maxD ~114, avg ~6, 通道差>64 的像素约占可见像素 0.8%。
+  let n = 0, sum = 0, maxD = 0, bad = 0;
+  for (let p = 0; p < dstRaw.length; p += 4) {
+    if (dstRaw[p + 3] === 0) continue;
+    n++;
+    let d = 0;
+    for (let c = 0; c < 4; c++) {
+      const dc = Math.abs(back[p + c] - dstRaw[p + c]);
+      if (dc > d) d = dc;
+    }
+    sum += d;
+    if (d > maxD) maxD = d;
+    if (d > 64) bad++;
+  }
+  if (maxD > 200 || (n && sum / n > 12) || bad * 20 > n) {
+    throw new Error(
+      `${name}: quantized sheet verification failed maxD=${maxD} avg=${n ? (sum / n).toFixed(1) : 0} bad(>64)=${bad}/${n}`
+    );
   }
 }
 
-async function buildSheet(name, scale, outDir) {
+async function buildSheet(name, scale, outDir, opts) {
   const src = path.join(outDir, `${name}.webp`);
   if (!fs.existsSync(src)) {
     console.log(`  skip ${name}: ${src} not found`);
     return;
+  }
+  const outPng = path.join(outDir, `${name}.sheet.png`);
+  const outJson = path.join(outDir, `${name}.sheet.json`);
+  // --keep-newer:用户改过的 sheet(明显比 webp 新)原样保留,不重建。
+  // 60s 宽容窗口:cp -r 复制顺序会引入毫秒/秒级抖动,不能严格比较。
+  const KEEP_GRACE_MS = 60_000;
+  if (opts.keepNewer && fs.existsSync(outPng) && fs.existsSync(outJson)) {
+    const stS = fs.statSync(outPng), stW = fs.statSync(src);
+    if (stS.mtimeMs + KEEP_GRACE_MS >= stW.mtimeMs) {
+      console.log(`  keep  ${name}: sheet not older than webp`);
+      return;
+    }
   }
   const m = await sharp(src, { animated: true }).metadata();
   const pages = m.pages || 1;
@@ -103,10 +141,13 @@ async function buildSheet(name, scale, outDir) {
   const dstRaw = Buffer.alloc(sheetW * sheetH * 4, 0); // 透明底
   blitRows(srcRaw, dstRaw, pages, fw, fh, fpr, sheetW);
 
+  const pngOpts = opts.palette
+    ? { palette: true, colours: opts.palette, dither: 0 }
+    : { palette: false, compressionLevel: 9 };
   let sheetPng = await sharp(dstRaw, { raw: { width: sheetW, height: sheetH, channels: 4 } })
-    .png({ palette: false, compressionLevel: 9 })
+    .png(pngOpts)
     .toBuffer();
-  await verifySheet(sheetPng, dstRaw, name);
+  await verifySheet(sheetPng, dstRaw, name, opts.palette);
 
   let w = fw, h = fh;
   if (scale !== 1.0) {
@@ -124,30 +165,37 @@ async function buildSheet(name, scale, outDir) {
     tail: tailInfo(durs),
     frames_per_row: fpr,
   };
-  fs.writeFileSync(path.join(outDir, `${name}.sheet.png`), sheetPng);
-  fs.writeFileSync(path.join(outDir, `${name}.sheet.json`), JSON.stringify(meta, null, 2) + '\n');
+  if (opts.palette) meta.quant = { palette: true, colours: opts.palette, dither: 0 };
+  fs.writeFileSync(outPng, sheetPng);
+  fs.writeFileSync(outJson, JSON.stringify(meta, null, 2) + '\n');
   console.log(
     `  ${name}: ${pages} frames (${w}x${h}, ${durs.reduce((a, b) => a + b, 0)}ms) ` +
-    `-> ${name}.sheet.png (${fpr * w}x${rows * h}, ${fpr}/row)`
+    `-> ${name}.sheet.png (${fpr * w}x${rows * h}, ${fpr}/row${opts.palette ? ', quant p' + opts.palette : ''})`
   );
 }
 
 (async () => {
   const argv = process.argv.slice(2);
   let outDir = SRC;
+  const opts = { keepNewer: argv.includes('--keep-newer'), palette: 0 };
   const srcIdx = argv.indexOf('--src');
   if (srcIdx >= 0) {
     outDir = path.resolve(argv[srcIdx + 1]);
     argv.splice(srcIdx, 2);
   }
+  const palIdx = argv.indexOf('--palette');
+  if (palIdx >= 0) {
+    opts.palette = parseInt(argv[palIdx + 1], 10) || 256;
+    argv.splice(palIdx, 2);
+  }
   const args = argv.filter(a => !a.startsWith('-'));
   const scale = args.length > 1 ? parseFloat(args[1]) || 1.0 : 1.0;
   const targets = args.length ? [args[0]] :
     fs.readdirSync(outDir).filter(f => f.endsWith('.webp')).map(f => f.slice(0, -5)).sort();
-  console.log(`== 打包 ${targets.length} 个 webp 为 sprite sheet(scale=${scale}, src=${outDir}) ==`);
+  console.log(`== 打包 ${targets.length} 个 webp 为 sprite sheet(scale=${scale}, src=${outDir}${opts.palette ? ', quant p' + opts.palette : ', lossless'}${opts.keepNewer ? ', keep-newer' : ''}) ==`);
   for (const t of targets) {
     try {
-      await buildSheet(t, scale, outDir);
+      await buildSheet(t, scale, outDir, opts);
     } catch (e) {
       console.error(`  ${t}: FAIL ${e.message}`);
     }

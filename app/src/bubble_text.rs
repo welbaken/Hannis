@@ -113,11 +113,9 @@ pub struct LiveStream {
 pub fn live_stream(snap: &Snapshot, source: Option<Source>, mode: Mode) -> Option<LiveStream> {
     let w = pick_session(snap, source, mode)?;
     let prefer_text = mode == Mode::Working;
-    // working mode shows the running tool instead of the live text: nothing
-    // is being typed while a tool is on screen
-    if prefer_text && w.tool.is_some() {
-        return None;
-    }
+    // NOTE: the live stream is followed even while a tool runs — the pet
+    // shows the DSH output/reasoning that keeps streaming, not a frozen
+    // tool label (the tool is only a fallback when nothing has streamed).
     let (kind, s): (u8, &str) = if prefer_text {
         if !w.live.text.is_empty() {
             (1, &w.live.text)
@@ -175,15 +173,20 @@ fn single_live_line(snap: &Snapshot, source: Option<Source>, mode: Mode, reveal:
         let label = if mode == Mode::Working { "正在干活…" } else { "思考中…" };
         return vec![format!("{tag}{label}")];
     };
-    // working: the actual work content = the running tool + its arguments;
-    // thinking: the reasoning stream (tail-truncated so it keeps scrolling)
+    // working prefers the live DSH stream (💬 text, else 🧠 reasoning) so the
+    // pet keeps showing the ongoing output; the running tool is only a
+    // fallback label while nothing has streamed yet. thinking always streams
+    // the reasoning.
     let content = if mode == Mode::Working {
-        if let Some(t) = &w.tool {
-            match &w.tool_args {
-                Some(args) if !args.is_empty() => {
-                    format!("⚙ {t}: {}", truncate_tail(args, max_line.saturating_sub(24)))
-                }
-                _ => format!("⚙ 正在执行: {t}"),
+        if w.live.text.is_empty() && w.live.reasoning.is_empty() {
+            match &w.tool {
+                Some(t) => match &w.tool_args {
+                    Some(args) if !args.is_empty() => {
+                        format!("⚙ {t}: {}", truncate_tail(args, max_line.saturating_sub(24)))
+                    }
+                    _ => format!("⚙ 正在执行: {t}"),
+                },
+                None => "正在干活…".to_string(),
             }
         } else {
             live_reveal(w, true, reveal, max_line)
@@ -331,9 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn working_prefers_tool_content_over_stale_output() {
-        // while a tool runs, the actual work content (tool) wins over the
-        // previous step's output text
+    fn working_prefers_live_stream_over_running_tool() {
+        // a running tool no longer hides the DSH stream: while text keeps
+        // streaming in, the pet shows it (the tool is only a fallback when
+        // nothing has streamed yet)
         let mut s = snap(Mode::Working);
         s.working.push(SessionInfo {
             session_id: "s1".into(),
@@ -343,12 +347,12 @@ mod tests {
             tool_args: None,
             task: None,
             todos: vec![],
-            live: LiveText { reasoning: String::new(), text: "上一段输出".into(), tool_name: None },
+            live: LiveText { reasoning: String::new(), text: "正在输出的正文".into(), tool_name: None },
         });
         let l = bubble_lines(&s, Some(Source::Dsh));
         assert_eq!(l.len(), 1);
-        assert!(l[0].contains("bash"));
-        assert!(!l[0].contains("上一段输出"));
+        assert!(l[0].contains("正在输出的正文"));
+        assert!(!l[0].contains("bash"));
     }
 
     #[test]
@@ -626,8 +630,9 @@ mod tests {
     }
 
     #[test]
-    fn live_stream_none_when_tool_or_no_live() {
-        // working with a running tool: the bubble shows the tool, nothing types
+    fn live_stream_follows_live_content_even_with_tool() {
+        // working with a running tool: the live reasoning is still streamed
+        // (working prefers text, then reasoning)
         let mut s = snap(Mode::Working);
         s.working.push(SessionInfo {
             session_id: "s1".into(),
@@ -639,6 +644,11 @@ mod tests {
             todos: vec![],
             live: LiveText { reasoning: "推导".into(), text: String::new(), tool_name: None },
         });
+        let st = live_stream(&s, Some(Source::Dsh), Mode::Working).unwrap();
+        assert_eq!(st.kind, 0);
+        assert_eq!(st.len, 2);
+        // no live content at all -> still None (tool is only a fallback)
+        s.working[0].live = LiveText::default();
         assert!(live_stream(&s, Some(Source::Dsh), Mode::Working).is_none());
         // thinking session without any live text yet
         let mut t = snap(Mode::Thinking);

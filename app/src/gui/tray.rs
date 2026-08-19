@@ -1,9 +1,9 @@
 //! Tray icon (Shell_NotifyIcon): prefers the `icon.png`-derived HICON,
 //! falls back to a runtime-drawn circle when no PNG is available.
-//! Right-click menu: 退出.
+//! Right-click menu: 回避模式 (checkable) / 退出.
 
 use super::window::{instance, WM_APP_TRAY};
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::HGDIOBJ;
 use windows::Win32::Graphics::Gdi::*;
@@ -11,6 +11,8 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const MENU_QUIT: usize = 1001;
+/// Toggle 回避模式 (avoid mode): pet runs from the cursor and returns home.
+pub const MENU_AVOID_TOGGLE: usize = 1002;
 
 pub struct Tray {
     hwnd: HWND,
@@ -103,14 +105,18 @@ impl Tray {
     }
 
         /// Show the right-click menu at the cursor; returns the chosen id.
-    /// The text-display switcher was intentionally omitted (屏蔽): the app
-    /// renders the phone bubble by default.
-    pub fn show_menu(&self) -> Option<usize> {
+    /// `avoid_enabled` controls the 回避模式 checkmark so the current state is
+    /// visible before the user picks anything.
+    pub fn show_menu(&self, avoid_enabled: bool) -> Option<usize> {
         unsafe {
             let menu = CreatePopupMenu().unwrap_or(HMENU::default());
             if menu.is_invalid() {
                 return None;
             }
+            let avoid_flags: MENU_ITEM_FLAGS =
+                if avoid_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, avoid_flags, MENU_AVOID_TOGGLE, w!("回避模式"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);

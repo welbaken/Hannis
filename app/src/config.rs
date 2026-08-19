@@ -24,6 +24,7 @@ pub struct Config {
     pub bubble: BubbleConfig,
     pub text: TextConfig,
     pub windows: WindowConfig,
+    pub avoid: AvoidConfig,
     pub autostart: bool,
 }
 
@@ -206,6 +207,42 @@ pub struct WindowConfig {
     pub celebrate_sec: u64,
 }
 
+/// 回避模式 (avoid mode): when enabled the pet scurries away from the mouse
+/// cursor and glides back to its original spot once the cursor leaves the pet's
+/// home area. Runtime toggle lives in the tray menu; the current state is
+/// persisted to config.json so it survives restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AvoidConfig {
+    /// Master switch. Defaults OFF; the tray menu item 回避模式 flips it live.
+    pub enabled: bool,
+    /// Trigger radius (px): cursor closer than this to the pet's *home* rect
+    /// starts a dodge. `distance * hysteresis` is where the pet decides the
+    /// cursor is gone and returns home, so the boundary has no jitter.
+    pub distance: f32,
+    /// How far (px) the pet jumps away from the cursor while dodging.
+    pub shift: f32,
+    /// Return threshold multiplier over `distance` (>= 1.0).
+    pub hysteresis: f32,
+    /// Dodge travel speed (px/s). High = the pet snatches away promptly.
+    pub dodge_speed: f32,
+    /// Return-to-home travel speed (px/s). Low = a slow, readable glide back.
+    pub return_speed: f32,
+}
+
+impl Default for AvoidConfig {
+    fn default() -> Self {
+        AvoidConfig {
+            enabled: false,
+            distance: 140.0,
+            shift: 380.0,
+            hysteresis: 1.6,
+            dodge_speed: 2600.0,
+            return_speed: 700.0,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -247,6 +284,7 @@ impl Default for Config {
             },
             text: TextConfig::default(),
             windows: WindowConfig { done_sec: 10, fail_sec: 10, celebrate_sec: 4 },
+            avoid: AvoidConfig::default(),
             autostart: false,
         }
     }
@@ -350,6 +388,14 @@ mod tests {
         assert_eq!(c2.bubble.type_cps, 90);
         assert!((c2.bubble.font_scale - 1.0).abs() < 1e-6);
         assert_eq!(c2.windows.done_sec, 10);
+        // avoid (回避模式) defaults to OFF with sane tuning
+        assert!(!c2.avoid.enabled);
+        assert!((c2.avoid.distance - 140.0).abs() < 1e-6);
+        assert!((c2.avoid.hysteresis - 1.6).abs() < 1e-6);
+        // old configs without the avoid section parse to the same default
+        let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
+        assert!(old.avoid.enabled == false && old.avoid.shift > 0.0);
+        assert!((old.avoid.return_speed - 700.0).abs() < 1e-6);
         // text section defaults to the phone bubble renderer
         assert_eq!(c2.text.mode, "bubble");
         assert_eq!(c2.text.outline_width, 1);

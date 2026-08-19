@@ -120,6 +120,11 @@ pub struct App {
     /// fullscreen app exits.
     pub hidden: bool,
     pub last_fs_check: Instant,
+    /// 回避模式 (avoid mode): the pet's resting spot, recorded the moment a
+    /// dodge begins, so it can glide back once the cursor leaves the area.
+    pub avoid_home: Option<(i32, i32)>,
+    /// True while the pet is currently displaced (dodging) by the cursor.
+    pub avoid_offscreen: bool,
 }
 
 fn now_ms() -> u64 {
@@ -249,6 +254,8 @@ pub fn run() {
         last_tick: Instant::now(),
         hidden: false,
         last_fs_check: Instant::now(),
+        avoid_home: None,
+        avoid_offscreen: false,
     });
     app.pet.set_celebrate_ms(celebrate_ms);
     let ptr = &mut *app as *mut App;
@@ -282,6 +289,31 @@ fn screen_size() -> (i32, i32) {
             GetSystemMetrics(SM_CXSCREEN),
             GetSystemMetrics(SM_CYSCREEN),
         )
+    }
+}
+
+/// Distance from a point to the nearest point on an axis-aligned rect.
+fn point_rect_dist(px: f32, py: f32, rx: f32, ry: f32, rw: f32, rh: f32) -> f32 {
+    let nx = px.clamp(rx, rx + rw);
+    let ny = py.clamp(ry, ry + rh);
+    let dx = px - nx;
+    let dy = py - ny;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Move `cur` toward `goal` at `speed` px/s over a `dt_ms` tick. Returns the
+/// new position and whether the goal was actually reached (within a pixel).
+fn move_toward(cur: (i32, i32), goal: (i32, i32), speed: f32, dt_ms: u64) -> ((i32, i32), bool) {
+    let step = speed.max(0.0) * (dt_ms as f32 / 1000.0);
+    let dx = goal.0 as f32 - cur.0 as f32;
+    let dy = goal.1 as f32 - cur.1 as f32;
+    let dist = (dx * dx + dy * dy).sqrt();
+    if dist < 0.5 || step >= dist {
+        (goal, true)
+    } else {
+        let nx = (cur.0 as f32 + dx / dist * step).round() as i32;
+        let ny = (cur.1 as f32 + dy / dist * step).round() as i32;
+        ((nx, ny), false)
     }
 }
 
@@ -535,6 +567,10 @@ impl App {
         // 7) fade
         self.update_fade(dt, &snap);
 
+        // 7b) 回避模式: scurry away from the cursor, glide back home once the
+        //     cursor leaves the pet's area. Moves the window only.
+        self.update_avoid(dt);
+
         // 8) compose + present (skip while hidden to save CPU during long
         //    fullscreen sessions; the DIB keeps the last frame for the
         //    SW_SHOW transition)
@@ -688,6 +724,125 @@ impl App {
         }
     }
 
+    /// 回避模式 (avoid mode). While enabled the pet dodges the cursor and,
+    /// once the cursor leaves its home area (`distance * hysteresis`), glides
+    /// back to the exact spot it was at when the dodge began.
+    ///
+    /// Trigger distance is measured against the pet's *home* rect, never the
+    /// current dodged rect: that way dodging itself can never re-trigger, the
+    /// pet stays clear while the cursor hovers near its home, and it reliably
+    /// returns the moment the cursor withdraws (no oscillation at the edge).
+    fn update_avoid(&mut self, dt: u64) {
+        let avoid = self.cfg.avoid.clone();
+        let active = avoid.enabled && !self.hidden && !self.dragging;
+        let (x, y, w, h) = self.window_size();
+        let (cx, cy) = window::cursor_pos();
+
+        // Disabled (tray toggle / hidden / being dragged): stop dodging and
+        // glide anything still displaced back to its remembered home.
+        if !active {
+            if let Some(home) = self.avoid_home {
+                self.avoid_offscreen = false;
+                let (goal_x, goal_y) = self.clamp_inside_screen(home.0, home.1, w, h);
+                let ((nx, ny), done) = move_toward((x, y), (goal_x, goal_y), avoid.return_speed, dt);
+                if done {
+                    self.avoid_home = None;
+                }
+                if nx != x || ny != y {
+                    window::set_window_rect(self.hwnd, nx, ny, w, h);
+                }
+            }
+            return;
+        }
+
+        let trigger = avoid.distance.max(1.0);
+        let home = self.avoid_home.unwrap_or((x, y));
+        let hdist = point_rect_dist(
+            cx as f32,
+            cy as f32,
+            home.0 as f32,
+            home.1 as f32,
+            w as f32,
+            h as f32,
+        );
+
+        let should_dodge = hdist < trigger;
+        if should_dodge && !self.avoid_offscreen {
+            // cursor entered the pet's home area: remember home, start dodging
+            if self.avoid_home.is_none() {
+                self.avoid_home = Some((x, y));
+            }
+            self.avoid_offscreen = true;
+            log_line(&format!("[avoid] dodge start (cursor {}px from home)", hdist.round() as i32));
+        } else if self.avoid_offscreen && hdist > trigger * avoid.hysteresis.max(1.0) {
+            // cursor left the area (with hysteresis): begin the glide home
+            self.avoid_offscreen = false;
+            log_line("[avoid] cursor left home area -> returning");
+        }
+
+        let home = self.avoid_home.unwrap_or((x, y));
+        if self.avoid_offscreen {
+            // Dodge target: home + `shift` px along (home_center -> cursor).
+            // Anchoring on home keeps the orbiting point reachable, so the pet
+            // settles exactly `shift` away and always returns to home.
+            let hcx = home.0 as f32 + w as f32 / 2.0;
+            let hcy = home.1 as f32 + h as f32 / 2.0;
+            let (mut vx, mut vy) = (hcx - cx as f32, hcy - cy as f32);
+            let len = (vx * vx + vy * vy).sqrt();
+            if len < 1.0 {
+                vx = -1.0;
+                vy = -1.0; // cursor dead-center: pick up-left
+            } else {
+                vx /= len;
+                vy /= len;
+            }
+            let goal_x = home.0 as f32 + vx * avoid.shift;
+            let goal_y = home.1 as f32 + vy * avoid.shift;
+            let (goal_x, goal_y) = self.clamp_inside_screen(goal_x as i32, goal_y as i32, w, h);
+            let ((nx, ny), _) = move_toward((x, y), (goal_x, goal_y), avoid.dodge_speed, dt);
+            if nx != x || ny != y {
+                window::set_window_rect(self.hwnd, nx, ny, w, h);
+            }
+        } else if let Some(home) = self.avoid_home {
+            // Returning: glide back to the recorded home at return speed.
+            let (goal_x, goal_y) = self.clamp_inside_screen(home.0, home.1, w, h);
+            let ((nx, ny), done) = move_toward((x, y), (goal_x, goal_y), avoid.return_speed, dt);
+            if done {
+                self.avoid_home = None;
+                log_line("[avoid] back home");
+            }
+            if nx != x || ny != y {
+                window::set_window_rect(self.hwnd, nx, ny, w, h);
+            }
+        }
+    }
+
+    /// Keep a window position on the virtual screen so a dodge/return can
+    /// never park the pet somewhere unreachable (same clamp as dragging).
+    fn clamp_inside_screen(&self, x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let (lo, hi) = (vx - w + 48, vx + vw - 48);
+            let nx = x.clamp(lo.min(hi), lo.max(hi));
+            let (lo, hi) = (vy - h + 48, vy + vh - 48);
+            let ny = y.clamp(lo.min(hi), lo.max(hi));
+            (nx, ny)
+        }
+    }
+
+    fn toggle_avoid(&mut self) {
+        self.cfg.avoid.enabled = !self.cfg.avoid.enabled;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        log_line(&format!("[avoid] tray toggle -> {}", self.cfg.avoid.enabled));
+        if !self.cfg.avoid.enabled {
+            // stop dodging; a displaced pet eases back home on the next tick
+            self.avoid_offscreen = false;
+        }
+    }
+
     fn compose(&mut self) {
         let (pet_w, pet_h) = self.pet_size();
         // The window is the pet plus a horizontal gutter on the left/right
@@ -789,6 +944,10 @@ impl App {
 
     pub fn on_lbutton_down(&mut self) {
         self.dragging = true;
+        // the user grabbed the pet: cancel any avoidance; the spot it ends up
+        // at after the drag becomes its new implicit home
+        self.avoid_offscreen = false;
+        self.avoid_home = None;
         self.last_interaction = Instant::now();
         log_line("[gui] lbutton down (drag start)");
         let (x, y, _, _) = self.window_size();
@@ -811,14 +970,7 @@ impl App {
             // pet somewhere unreachable; a windowless stale instance would
             // then block all relaunches). Keep at least a sliver visible so
             // the pet can always be grabbed again.
-            let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-            let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-            let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-            let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-            let (lo, hi) = (vx - w + 48, vx + vw - 48);
-            let nx = nx0.clamp(lo.min(hi), lo.max(hi));
-            let (lo, hi) = (vy - h + 48, vy + vh - 48);
-            let ny = ny0.clamp(lo.min(hi), lo.max(hi));
+            let (nx, ny) = self.clamp_inside_screen(nx0, ny0, w, h);
             window::set_window_rect(self.hwnd, nx, ny, w, h);
         }
     }
@@ -843,6 +995,10 @@ impl App {
         }
         self.cfg.display.scale = s;
         let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        // resizing re-anchors the window bottom-right, invalidating any
+        // remembered avoid home; the next dodge re-records it
+        self.avoid_offscreen = false;
+        self.avoid_home = None;
         // reload at the new scale; keep the old frames on screen meanwhile
         let asset = if self.mode == Mode::Offline { "idle" } else { self.mode.asset() };
         self.pending = Some(self.mode);
@@ -851,11 +1007,13 @@ impl App {
 
     pub fn show_tray_menu(&mut self) {
         if let Some(t) = &self.tray {
-            if let Some(cmd) = t.show_menu() {
-                if cmd == tray::MENU_QUIT {
-                    unsafe {
+            if let Some(cmd) = t.show_menu(self.cfg.avoid.enabled) {
+                match cmd {
+                    tray::MENU_QUIT => unsafe {
                         PostQuitMessage(0);
-                    }
+                    },
+                    tray::MENU_AVOID_TOGGLE => self.toggle_avoid(),
+                    _ => {}
                 }
             }
         }

@@ -17,13 +17,13 @@ pub const BUBBLE_MARGIN_Y: u32 = 10;
 /// It may extend under the pet body, which is fine (部分遮挡).
 pub const MAX_BUBBLE_W: u32 = 186;
 pub const MIN_BUBBLE_W: u32 = 144;
-pub const MAX_BUBBLE_H: u32 = 600;
+pub const MAX_BUBBLE_H: u32 = 400;
 /// Force a minimum height so even short content keeps the phone-screen
 /// (taller-than-wide) silhouette instead of collapsing into a landscape
 /// pill.
 pub const MIN_BUBBLE_H: u32 = 390;
 /// How transparent the white fill is (0 = invisible, 255 = opaque).
-pub const FILL_ALPHA: u8 = 10;
+pub const FILL_ALPHA: u8 = 50;
 
 pub(crate) fn scaled(v: u32, s: f32) -> u32 {
     ((v as f32) * s).round().max(1.0) as u32
@@ -141,7 +141,7 @@ impl Bubble {
         // soft shadow (visible on light backgrounds)
         comp.fill_round_rect(x + border as i32 + 1, y + border as i32 + 3, self.w, self.h, radius, (0, 0, 0), 46);
         // dark border ring
-        comp.fill_round_rect(x, y, self.w, self.h, radius, (70, 70, 70), 210);
+        comp.fill_round_rect(x, y, self.w, self.h, radius, (70, 70, 70), 50);
         // semi-transparent white fill
         comp.fill_round_rect(
             x + border as i32,

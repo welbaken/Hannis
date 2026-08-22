@@ -2,9 +2,9 @@
 //! Each source spawns its own thread(s) and emits StateEvent into a shared
 //! channel. Health flips are emitted as SourceHealth on transitions only.
 
-pub mod comfyui;
 pub mod dsh;
 pub mod hermes;
+pub mod lua;
 
 use crate::state::StateEvent;
 use std::sync::atomic::AtomicBool;

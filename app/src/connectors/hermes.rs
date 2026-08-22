@@ -46,6 +46,7 @@ impl HermesConnector {
     }
 
     fn loop_run(&self, tx: Sender<StateEvent>, stop: Arc<AtomicBool>) {
+        let mut last_err: Option<String> = None;
         let mut prev: HashMap<String, PrevSession> = HashMap::new();
         let mut healthy = false;
         let mut conn: Option<rusqlite::Connection> = self.open().ok();
@@ -75,13 +76,17 @@ impl HermesConnector {
                         healthy = true;
                         send(&tx, StateEvent::SourceHealth { source: Source::Hermes, healthy: true });
                         eprintln!("[hermes] health -> true");
+                        last_err = None;
                     }
                     for ev in events {
                         send(&tx, ev);
                     }
                 }
                 Err(e) => {
-                    eprintln!("[hermes] poll error: {e}");
+                    if last_err.as_deref() != Some(e.as_str()) {
+                        eprintln!("[hermes] poll error: {e}");
+                        last_err = Some(e.clone());
+                    }
                     if healthy {
                         healthy = false;
                         send(&tx, StateEvent::SourceHealth { source: Source::Hermes, healthy: false });

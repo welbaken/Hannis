@@ -14,3 +14,6 @@ config.json
 dist/
 # Windows download zone marker
 **/*:Zone.Identifier
+# runtime logs / scratch media
+maa.log
+mp4/

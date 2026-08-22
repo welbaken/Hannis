@@ -13,6 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub const MENU_QUIT: usize = 1001;
 /// Toggle 回避模式 (avoid mode): pet runs from the cursor and returns home.
 pub const MENU_AVOID_TOGGLE: usize = 1002;
+/// Toggle 自动收起 (auto-hide): idle/offline 太久就把宠物收到任务栏后。
+pub const MENU_AUTOHIDE_TOGGLE: usize = 1003;
 
 pub struct Tray {
     hwnd: HWND,
@@ -105,9 +107,9 @@ impl Tray {
     }
 
         /// Show the right-click menu at the cursor; returns the chosen id.
-    /// `avoid_enabled` controls the 回避模式 checkmark so the current state is
-    /// visible before the user picks anything.
-    pub fn show_menu(&self, avoid_enabled: bool) -> Option<usize> {
+    /// `avoid_enabled` / `auto_hide_enabled` control the checkmarks so the
+    /// current states are visible before the user picks anything.
+    pub fn show_menu(&self, avoid_enabled: bool, auto_hide_enabled: bool) -> Option<usize> {
         unsafe {
             let menu = CreatePopupMenu().unwrap_or(HMENU::default());
             if menu.is_invalid() {
@@ -116,6 +118,9 @@ impl Tray {
             let avoid_flags: MENU_ITEM_FLAGS =
                 if avoid_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, avoid_flags, MENU_AVOID_TOGGLE, w!("回避模式"));
+            let hide_flags: MENU_ITEM_FLAGS =
+                if auto_hide_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, hide_flags, MENU_AUTOHIDE_TOGGLE, w!("自动收起"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
             let mut pt = POINT::default();

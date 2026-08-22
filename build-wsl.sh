@@ -30,6 +30,7 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 cp "$APP/target/x86_64-pc-windows-gnu/release/hannis.exe" "$DIST/Hannis.exe"
 cp -r "$ROOT/resource" "$DIST/resource"
+cp -r "$ROOT/scripts" "$DIST/scripts"
 cp "$ROOT/icon.png" "$DIST/icon.png"
 if [ -f "$APP/config.json" ]; then
   cp "$APP/config.json" "$DIST/config.json"

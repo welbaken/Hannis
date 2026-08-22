@@ -3,10 +3,11 @@
 //
 // 把 resource/<state>.webp 打包为:
 //   resource/<state>.sheet.png   — 所有帧按网格排布在一张大图上
-//   resource/<state>.sheet.json  — 元数据(单帧尺寸/帧数/每帧时长/tail)
+//   resource/<state>.sheet.json  — 元数据(单帧尺寸/帧数/网格列数)
 //
 // 运行期 anim.rs 优先按 sheet 加载:单文件一次解码,启动/切换零解码延迟,
-// 同时避免拆帧方式在 resource/ 下散落几十个 PNG。
+// 同时避免拆帧方式在 resource/ 下散落几十个 PNG。每帧时长不再写入 JSON,
+// 播放统一使用 config 的 display.frame_ms(默认 42ms/帧)。
 //
 // 实现要点:动画帧在 sharp 中按页垂直堆叠,先把整叠解码为 raw RGBA,
 // 再纯内存拷贝到网格画布,最后一次性 PNG 编码(避免逐帧解/编码)。
@@ -34,18 +35,6 @@ const sharp = loadSharp();
 
 const SRC = path.join(__dirname, '..', 'resource');
 const MAX_SHEET_WIDTH = 8192; // 避开旧 GPU 16384 上限,同时单张 PNG 尺寸合理
-const TAIL_MS = 1000;
-const DEFAULT_MS = 42;
-
-function tailInfo(durs) {
-  let acc = 0, start = durs.length;
-  for (let i = durs.length - 1; i >= 0; i--) {
-    acc += durs[i];
-    if (acc >= TAIL_MS) { start = i; break; }
-  }
-  if (start === durs.length) start = 0;
-  return { start, end: durs.length - 1 };
-}
 
 /** 把 srcRaw(每页 fh 行)按网格拷贝进 sheet 画布。 */
 function blitRows(srcRaw, sheetRaw, pages, fw, fh, fpr, sheetW) {
@@ -125,8 +114,6 @@ async function buildSheet(name, scale, outDir, opts) {
   const pages = m.pages || 1;
   const fw = m.width;
   const fh = m.pageHeight || m.height;
-  let durs = (m.delay && m.delay.length ? m.delay : [DEFAULT_MS]).slice(0, pages);
-  while (durs.length < pages) durs.push(DEFAULT_MS);
 
   const fpr = Math.max(1, Math.min(pages, Math.floor(MAX_SHEET_WIDTH / fw)));
   const rows = Math.ceil(pages / fpr);
@@ -156,20 +143,17 @@ async function buildSheet(name, scale, outDir, opts) {
     sheetPng = await sharp(sheetPng).resize(fpr * w, rows * h).png().toBuffer();
   }
 
+  // 只保留加载器需要的几何字段;每帧时长统一走 config display.frame_ms。
   const meta = {
-    state: name,
     width: w,
     height: h,
     frame_count: pages,
-    durations_ms: durs,
-    tail: tailInfo(durs),
     frames_per_row: fpr,
   };
-  if (opts.palette) meta.quant = { palette: true, colours: opts.palette, dither: 0 };
   fs.writeFileSync(outPng, sheetPng);
   fs.writeFileSync(outJson, JSON.stringify(meta, null, 2) + '\n');
   console.log(
-    `  ${name}: ${pages} frames (${w}x${h}, ${durs.reduce((a, b) => a + b, 0)}ms) ` +
+    `  ${name}: ${pages} frames (${w}x${h}) ` +
     `-> ${name}.sheet.png (${fpr * w}x${rows * h}, ${fpr}/row${opts.palette ? ', quant p' + opts.palette : ''})`
   );
 }

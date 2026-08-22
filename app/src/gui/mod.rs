@@ -4,7 +4,6 @@
 
 pub mod bubble;
 pub mod icon;
-pub mod plaintext;
 pub mod render;
 pub mod tray;
 pub mod window;
@@ -12,14 +11,13 @@ pub mod window;
 use dshpet::anim::{load_animation, load_loop_animation, Animation, Frame, Player};
 use dshpet::bubble_text;
 use dshpet::config::Config;
-use dshpet::connectors::comfyui::ComfyUiConnector;
 use dshpet::connectors::dsh::DshConnector;
 use dshpet::connectors::hermes::HermesConnector;
 use dshpet::connectors::stop_flag;
 use dshpet::state::{Mode, PetState, Snapshot, StateEvent};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
@@ -87,12 +85,15 @@ pub struct App {
     pub resource_dir: PathBuf,
     pub pet: PetState,
     pub rx: Receiver<StateEvent>,
+    /// Event sender: used to emit `Tick` so the pending-request TTL reaper
+    /// actually runs (nothing else drives it).
+    pub tx: Sender<StateEvent>,
     pub stop: Arc<AtomicBool>,
     pub load_slot: Arc<Mutex<LoadSlot>>,
     pub loading: Option<String>,
     pub anim: Option<Arc<Animation>>,
     pub player: Option<Player>,
-    /// Preloaded separate loop animation (`<state>_loop.webp`), if any.
+    /// Preloaded separate loop animation (`<state>_loop.sheet.*`), if any.
     pub loop_anim: Option<Arc<Animation>>,
     pub loop_switched: bool,
     pub mode: Mode,
@@ -100,11 +101,15 @@ pub struct App {
     pub pending: Option<Mode>,
     pub comp: render::Compositor,
     pub bubble: bubble::Bubble,
-    pub bubble_lines: Vec<String>,
-    /// "Behind the pet" text stream overlay (config `text.mode == "behind"`).
-    pub text_overlay: plaintext::TextOverlay,
+    /// Structured bubble content (header row + divider + stream).
+    pub bubble_text: bubble_text::BubbleText,
     /// Typewriter reveal cursor: (session_id, stream kind, chars revealed).
     pub reveal: Option<(String, u8, f32)>,
+    /// 轮流显示: session whose message the bubble currently shows, and the
+    /// last time (now_ms) that message changed. A pick whose message stays
+    /// unchanged for ROTATE_AFTER_MS is handed to another session with content.
+    pub bubble_pick: Option<String>,
+    pub bubble_stale_since: Option<u64>,
     pub last_interaction: Instant,
     pub fade_alpha: f32,
     pub dragging: bool,
@@ -125,6 +130,38 @@ pub struct App {
     pub avoid_home: Option<(i32, i32)>,
     /// True while the pet is currently displaced (dodging) by the cursor.
     pub avoid_offscreen: bool,
+    /// Non-transparent pet bbox in window-local coords (x_off, y_off, w, h),
+    /// cached from the loaded animation's first frame so the avoid trigger
+    /// hugs the pet's visible body instead of the whole layered window rect.
+    /// None = not scanned yet -> the full window rect is used as a fallback.
+    pub avoid_box: Option<(i32, i32, i32, i32)>,
+    /// Dirty-flag rendering: set when compose-relevant state changed since
+    /// the last present (mode/animation switch, bubble text, zoom...).
+    /// The 15 ms timer early-outs without recompositing when nothing moved —
+    /// idle CPU drops to near zero instead of redrawing at 66 fps.
+    pub dirty_request: bool,
+    /// (animation name, frame index) of the last composed frame; None =
+    /// nothing composed yet. Compared each tick to skip redundant redraws.
+    pub composed: Option<(String, usize)>,
+    /// Fade alpha of the last composed frame (fade transitions redraw).
+    pub composed_fade: f32,
+    /// 自动收起(auto-hide):idle/offline 连续持续的起点(None=不在计时)。
+    pub collapse_idle_since: Option<Instant>,
+    /// 已处于收起状态(下移到任务栏后 + 更透明 + 鼠标穿透)。
+    pub collapsed: bool,
+    /// 收起前的窗口位置,退出收起时恢复。
+    pub collapse_home: Option<(i32, i32)>,
+    /// 悬停计时起点(now_ms);None=光标不在宠物窗口上。
+    pub collapse_hover_since: Option<u64>,
+    /// 收起时从缓冲区底部裁掉的像素行数(被任务栏盖住的身体部分留透明)。
+    pub collapse_clip: i32,
+    /// 收起/恢复的滑动目标位置;None=静止。按下→目标用 move_toward 逐帧滑动。
+    pub collapse_anim: Option<(i32, i32)>,
+    /// 气泡淡入系数(0..1):出现时 200ms 内从 0 → 1(配合 8px 滑入)。
+    pub bubble_fade: f32,
+    /// 自动收起恢复后:回避模式先挂起,直到光标首次离开宠物(避免"叫回来
+    /// 立刻又被躲开/被回避拉扯回不了原位")。
+    pub avoid_arm_after_leave: bool,
 }
 
 fn now_ms() -> u64 {
@@ -202,13 +239,19 @@ pub fn run() {
     } else {
         eprintln!("hermes db path unresolvable -> hermes disabled");
     }
-    if cfg.comfyui.enabled {
-        ComfyUiConnector {
-            url: cfg.comfyui.url.clone(),
-            poll_ms: cfg.comfyui.poll_ms,
-            ws: cfg.comfyui.ws,
+    // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
+    for (i, sc) in cfg.scripts.iter().enumerate() {
+        if sc.file.trim().is_empty() {
+            eprintln!("[lua] scripts[{i}] has empty file, skipped");
+            continue;
         }
-        .spawn(tx.clone(), stop.clone());
+        let mut sc = sc.clone();
+        // 相对路径按 exe 目录解析(不能依赖进程 CWD:快捷方式启动时
+        // CWD 常是 System32,之前会静默加载失败 → 该源无反应)
+        sc.file = Config::resolve_script_path(&exe_dir, &sc.file).display().to_string();
+        log_line(&format!("[lua] scripts[{i}] file -> {}", sc.file));
+        dshpet::connectors::lua::make(i as u16, sc, Some(exe_dir.join("hannis.log")))
+            .spawn(tx.clone(), stop.clone());
     }
 
     let done_ms = cfg.windows.done_sec * 1000;
@@ -219,14 +262,31 @@ pub fn run() {
     let w = ((800.0 + WINDOW_EXTRA_W as f32) * scale) as i32;
     let h = (800.0 * scale) as i32;
     let (sx, sy) = screen_size();
-    let x = (sx - w - RIGHT_MARGIN).max(0);
-    let y = (sy - h - 80).max(0);
+    let mut x = (sx - w - RIGHT_MARGIN).max(0);
+    let mut y = (sy - h - 80).max(0);
+    if let (Some(px), Some(py)) = (cfg.window_pos.x, cfg.window_pos.y) {
+        // restore the pet's last dragged spot, clamped to the virtual
+        // screen so a monitor layout change can never park it unreachable
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let (lo, hi) = (vx - w + 48, vx + vw - 48);
+            x = px.clamp(lo.min(hi), lo.max(hi));
+            let (lo, hi) = (vy - h + 48, vy + vh - 48);
+            y = py.clamp(lo.min(hi), lo.max(hi));
+        }
+        log_line(&format!("[gui] restore window pos ({x}, {y})"));
+    }
 
+    let bubble_theme = dshpet::config::BubbleTheme::resolve(&cfg.bubble.theme);
     let mut app = Box::new(App {
         cfg,
         resource_dir,
         pet: PetState::new(done_ms, fail_ms),
         rx,
+        tx,
         stop,
         load_slot: Arc::new(Mutex::new(LoadSlot::default())),
         loading: None,
@@ -239,9 +299,10 @@ pub fn run() {
         pending: None,
         comp: render::Compositor::new(HWND::default(), 1.0),
         bubble: bubble::Bubble::default(),
-        bubble_lines: Vec::new(),
-        text_overlay: plaintext::TextOverlay::default(),
+        bubble_text: bubble_text::BubbleText::default(),
         reveal: None,
+        bubble_pick: None,
+        bubble_stale_since: None,
         last_interaction: Instant::now(),
         fade_alpha: 1.0,
         dragging: false,
@@ -256,14 +317,31 @@ pub fn run() {
         last_fs_check: Instant::now(),
         avoid_home: None,
         avoid_offscreen: false,
+        avoid_box: None,
+        dirty_request: true, // first tick must present once
+        composed: None,
+        composed_fade: 1.0,
+        collapse_idle_since: None,
+        collapsed: false,
+        collapse_home: None,
+        collapse_hover_since: None,
+        collapse_clip: 0,
+        collapse_anim: None,
+        bubble_fade: 0.0,
+        avoid_arm_after_leave: false,
     });
     app.pet.set_celebrate_ms(celebrate_ms);
+    app.bubble.theme = bubble_theme;
     let ptr = &mut *app as *mut App;
     let hwnd = window::create_main_window(ptr, w, h, icon.unwrap_or(HICON::default()));
     app.hwnd = hwnd;
     app.comp = render::Compositor::new(hwnd, font_scale);
     window::set_window_rect(hwnd, x, y, w, h);
     window::show(hwnd);
+    // 注意:不再对整窗调用 DWM accent(SetWindowCompositionAttribute):
+    // (1) 系统是分层窗口,Win11 上该 API 要么静默失效,要么把 80% 白色渐变
+    //     刷满整窗(透明背景变白不透明);(2) 亚克力由气泡的软件实现
+    //     (截屏→反混合→模糊→着色)提供,只作用于卡片区域。
     unsafe {
         let _ = SetTimer(hwnd, TIMER_RENDER, TIMER_MS, None);
     }
@@ -329,7 +407,7 @@ impl App {
         self.loading = Some(state.to_string());
         let dir = self.resource_dir.clone();
         let scale = self.cfg.display.scale.clamp(0.25, 2.0);
-        let use_split = self.cfg.display.use_split.clone();
+        let frame_ms = self.cfg.display.frame_ms;
         let slot = self.load_slot.clone();
         let mode = self.mode;
         let state = state.to_string();
@@ -341,11 +419,11 @@ impl App {
             let slot2 = slot.clone();
             let state2 = state.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                match load_animation(&dir, &state2, scale, &use_split) {
+                match load_animation(&dir, &state2, scale, frame_ms) {
                     Ok(a) => {
                         let a = Arc::new(a);
                         // preload the separate loop animation while we are at it
-                        let loop_anim = load_loop_animation(&dir, &state2, scale, &use_split)
+                        let loop_anim = load_loop_animation(&dir, &state2, scale, frame_ms)
                             .map(Arc::new);
                         if loop_anim.is_some() {
                             log_line(&format!("[anim] loop file found for {state2}"));
@@ -372,6 +450,10 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_millis() as u64;
         self.last_tick = now;
+        // drive the pending-request TTL reaper (approvals/questions older
+        // than TTL_APPROVAL_MS get dropped); without this the 30-min safety
+        // net never runs and a stale pending keeps attention forever
+        let _ = self.tx.send(StateEvent::Tick);
 
         // 0) fullscreen detection: poll every ~500ms so the pet steps out
         //    of the way when a game / video goes fullscreen on the same
@@ -428,6 +510,8 @@ impl App {
                 self.cf_from = self.current_frame_clone();
                 self.cf_t = 0.0;
                 self.anim = Some(a.clone());
+                self.dirty_request = true;
+                self.refresh_avoid_box(); // bbox for the 回避模式 trigger
                 self.loop_anim = la;
                 self.loop_switched = false;
                 self.loading = None;
@@ -462,6 +546,7 @@ impl App {
             }
             if self.anim.is_none() {
                 self.pending = Some(Mode::Offline);
+                self.dirty_request = true;
                 self.spawn_load("idle");
             }
         }
@@ -504,6 +589,7 @@ impl App {
                             eprintln!("[gui] switching to loop anim {}", la.name);
                             log_line(&format!("[gui] switching to loop anim {}", la.name));
                             self.anim = Some(la.clone());
+                            self.refresh_avoid_box(); // new bbox for 回避模式
                             self.player = Some(Player::new(
                                 &la,
                                 true,
@@ -518,50 +604,105 @@ impl App {
             self.spawn_load(self.mode.asset());
         }
 
-        // 6) text: hidden while resting or fully disconnected. Both renderers
-        //    use the wide per-line window (text.max_chars): the phone bubble
-        //    tail-fits it into its enlarged box in bubble::layout, the
-        //    behind-the-pet stream lays it out against the pet box.
+        // 6) text: hidden while resting or fully disconnected. The phone
+        //    bubble shows structured content (header row + divider + stream)
+        //    from bubble_text::BubbleText, using the wide per-line window
+        //    (text.max_chars).
+        // 气泡淡入:出现时 200ms 从 0→1(内容为空则立即归零)
+        let fade_target = if self.bubble.visible() { 1.0 } else { 0.0 };
+        let fade_k = ((dt as f32) / 200.0).min(1.0);
+        self.bubble_fade += (fade_target - self.bubble_fade) * fade_k;
+        if self.bubble_fade > 0.999 {
+            self.bubble_fade = 1.0;
+        }
+        if fade_target == 0.0 {
+            self.bubble_fade = 0.0;
+        }
         let sel = self.pet.select_bubble_source();
         let type_cps = self.cfg.bubble.type_cps;
         let max_chars = self.cfg.text.max_chars;
-        let lines = if matches!(effective, Mode::Idle | Mode::Offline | Mode::Move) {
-            Vec::new()
-        } else if type_cps > 0 && matches!(effective, Mode::Thinking | Mode::Working) {
-            // typewriter: reveal the live stream char by char
-            let stream = bubble_text::live_stream(&snap, sel, effective);
-            let same = match (&self.reveal, &stream) {
-                (Some((sid, kind, _)), Some(s)) => *sid == s.session_id && *kind == s.kind,
-                (None, None) => true,
-                _ => false,
-            };
-            if !same {
-                // new session / new stream (e.g. next turn): start over
-                self.reveal = stream.as_ref().map(|s| (s.session_id.clone(), s.kind, 0.0));
+        let tick_now = now_ms();
+        if matches!(effective, Mode::Idle | Mode::Offline | Mode::Move) {
+            self.bubble_pick = None;
+            self.bubble_stale_since = None;
+            self.reveal = None;
+            // The Bubble widget keeps its own laid-out text copy (`visible()`
+            // and `draw()` read it): resetting only the App-level
+            // `bubble_text` here left the last message (e.g. "任务完成啦")
+            // on screen forever once the pet returned to idle. layout() with
+            // an empty title clears the widget (and reports whether anything
+            // actually changed, so the repaint only fires on a real change).
+            let cleared = self.bubble.layout(bubble_text::BubbleText::default(), 0, 0, &self.comp);
+            self.bubble_text = bubble_text::BubbleText::default();
+            if cleared {
+                self.dirty_request = true;
             }
-            let pos = match (&mut self.reveal, &stream) {
-                (Some((_, _, pos)), Some(s)) => {
-                    *pos += type_cps as f32 * dt as f32 / 1000.0;
-                    let p = (*pos as usize).min(s.len);
-                    // keep up with a fast stream: never lag more than one
-                    // and a half visible windows behind the newest chars
-                    if s.len.saturating_sub(p) > TYPE_LAG_CHARS {
-                        *pos = (s.len - TYPE_LAG_CHARS) as f32;
-                    }
-                    Some(p)
+        } else if matches!(effective, Mode::Thinking | Mode::Working) {
+            // 轮流显示: keep the current session while its message keeps
+            // updating; once it has been static for ROTATE_AFTER_MS and
+            // another session has content, hand the bubble over to it.
+            let stale = self
+                .bubble_stale_since
+                .map(|at| tick_now.saturating_sub(at) >= bubble_text::ROTATE_AFTER_MS)
+                .unwrap_or(false);
+            let pick = bubble_text::rotate_pick(&snap, sel, effective, self.bubble_pick.as_deref(), stale);
+            if pick != self.bubble_pick {
+                self.bubble_pick = pick.clone();
+                self.bubble_stale_since = Some(tick_now);
+            }
+            let prefer = self.bubble_pick.as_deref();
+            let pos = if type_cps > 0 {
+                // typewriter: reveal the live stream char by char
+                let stream = bubble_text::live_stream_pinned(&snap, sel, effective, prefer);
+                let same = match (&self.reveal, &stream) {
+                    (Some((sid, kind, _)), Some(s)) => *sid == s.session_id && *kind == s.kind,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    // new session / new stream (e.g. next turn): start over
+                    self.reveal = stream.as_ref().map(|s| (s.session_id.clone(), s.kind, 0.0));
                 }
-                _ => None,
+                let p = match (&mut self.reveal, &stream) {
+                    (Some((_, _, pos)), Some(s)) => {
+                        *pos += type_cps as f32 * dt as f32 / 1000.0;
+                        let p = (*pos as usize).min(s.len);
+                        // keep up with a fast stream: never lag more than one
+                        // and a half visible windows behind the newest chars
+                        if s.len.saturating_sub(p) > TYPE_LAG_CHARS {
+                            *pos = (s.len - TYPE_LAG_CHARS) as f32;
+                        }
+                        Some(p)
+                    }
+                    _ => None,
+                };
+                p
+            } else {
+                self.reveal = None;
+                None
             };
-            bubble_text::stream_lines(&snap, sel, pos, max_chars)
+            let text = bubble_text::bubble_text_pinned(&snap, sel, prefer, pos, max_chars);
+            // a changed message resets the staleness timer
+            if text != self.bubble_text {
+                self.bubble_stale_since = Some(tick_now);
+                self.bubble_text = text;
+                self.dirty_request = true;
+                let pet_w = self.pet_size().0;
+                let pet_h = self.pet_size().1;
+                self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp);
+            }
         } else {
             self.reveal = None;
-            bubble_text::stream_lines(&snap, sel, None, max_chars)
-        };
-        if lines != self.bubble_lines {
-            self.bubble_lines = lines;
-            let pet_w = self.pet_size().0;
-            let pet_h = self.pet_size().1;
-            self.bubble.layout(self.bubble_lines.clone(), pet_w, pet_h, &self.comp);
+            self.bubble_pick = None;
+            self.bubble_stale_since = None;
+            let text = bubble_text::bubble_text_pinned(&snap, sel, None, None, max_chars);
+            if text != self.bubble_text {
+                self.bubble_text = text;
+                self.dirty_request = true;
+                let pet_w = self.pet_size().0;
+                let pet_h = self.pet_size().1;
+                self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp);
+            }
         }
 
         // 7) fade
@@ -571,11 +712,47 @@ impl App {
         //     cursor leaves the pet's area. Moves the window only.
         self.update_avoid(dt);
 
+        // 7c) 自动收起(auto-hide):idle/offline 太久 → 下移到任务栏后、
+        //     更透明、鼠标穿透;有新消息或悬停超时 → 恢复。
+        self.update_collapse(dt);
+
         // 8) compose + present (skip while hidden to save CPU during long
         //    fullscreen sessions; the DIB keeps the last frame for the
-        //    SW_SHOW transition)
+        //    SW_SHOW transition). Dirty-flag rendering: the 15ms timer only
+        //    recomposites when something actually changed — an animation
+        //    frame boundary, a cross-fade in flight, bubble text, the fade
+        //    alpha, or the window size — otherwise the previous frame stays
+        //    up and the tick early-outs (idle CPU ≈ 0 instead of 66 fps).
         if !self.hidden {
-            self.compose();
+            let mut dirty = self.dirty_request;
+            self.dirty_request = false;
+            if self.cf_from.is_some() {
+                dirty = true;
+            }
+            let anim_key = self
+                .anim
+                .as_ref()
+                .map(|a| a.name.clone())
+                .zip(self.player.as_ref().map(|p| p.idx));
+            if anim_key != self.composed {
+                dirty = true;
+            }
+            if (self.fade_alpha - self.composed_fade).abs() > 0.002 {
+                dirty = true;
+            }
+            let (_, _, w, h) = self.window_size();
+            if w as u32 != self.comp.win_w || h as u32 != self.comp.win_h {
+                dirty = true;
+            }
+            if dirty {
+                self.compose();
+                self.composed = self
+                    .anim
+                    .as_ref()
+                    .map(|a| a.name.clone())
+                    .zip(self.player.as_ref().map(|p| p.idx));
+                self.composed_fade = self.fade_alpha;
+            }
         }
     }
 
@@ -672,6 +849,7 @@ impl App {
         eprintln!("[gui] mode: {:?} -> {:?}", self.mode, m);
         log_line(&format!("[gui] mode: {:?} -> {:?}", self.mode, m));
         self.mode = m;
+        self.dirty_request = true;
         // state change cancels the fade-out and restarts the countdown
         self.fade_alpha = 1.0;
         self.last_interaction = Instant::now();
@@ -711,11 +889,15 @@ impl App {
             .iter()
             .any(|s| s.as_str() == self.mode.asset() || s.as_str() == format!("{:?}", self.mode).to_lowercase());
         let idle_for = self.last_interaction.elapsed().as_secs();
-        let target = if disabled || idle_for < self.cfg.fade.fade_after_sec {
+        let mut target = if disabled || idle_for < self.cfg.fade.fade_after_sec {
             1.0
         } else {
             self.cfg.fade.fade_target.clamp(0.0, 1.0)
         };
+        if self.collapsed {
+            // 自动收起:在渐隐基础上进一步变透明(同一套 lerp 平滑过渡)
+            target *= self.cfg.auto_hide.opacity.clamp(0.05, 1.0);
+        }
         let fade_ms = self.cfg.fade.fade_ms.max(50) as f32;
         let k = ((dt as f32) * 4.0 / fade_ms).min(1.0);
         self.fade_alpha += (target - self.fade_alpha) * k;
@@ -728,15 +910,41 @@ impl App {
     /// once the cursor leaves its home area (`distance * hysteresis`), glides
     /// back to the exact spot it was at when the dodge began.
     ///
-    /// Trigger distance is measured against the pet's *home* rect, never the
-    /// current dodged rect: that way dodging itself can never re-trigger, the
-    /// pet stays clear while the cursor hovers near its home, and it reliably
-    /// returns the moment the cursor withdraws (no oscillation at the edge).
+    /// Trigger distance is measured against the pet's *home* visual rect — the
+    /// non-transparent bbox cached in `avoid_box`, NOT the whole layered window
+    /// (which also spans the transparent bubble gutter and clear sprite
+    /// margins). The visual rect costs nothing per tick (it is cached on
+    /// loading). Dodging against the home rect, never the current dodged rect,
+    /// prevents re-triggering and edge oscillation: the pet stays clear while
+    /// the cursor hovers near its home and returns the moment the cursor
+    /// withdraws.
     fn update_avoid(&mut self, dt: u64) {
         let avoid = self.cfg.avoid.clone();
-        let active = avoid.enabled && !self.hidden && !self.dragging;
         let (x, y, w, h) = self.window_size();
         let (cx, cy) = window::cursor_pos();
+        let (fx, fy, fw, fh) = self.pet_visual_rect();
+        // The pet's visible-body rect anchored at any window position.
+        let anchor = |ax: i32, ay: i32| (ax + fx, ay + fy, fw.max(1), fh.max(1));
+        let trigger = avoid.distance.max(1.0);
+        // 收起/恢复滑动期间回避不参与(否则"悬停叫回"会被回避搅乱);
+        // 恢复完成后先挂起,等光标首次离开宠物再武装(避免立刻被躲开)。
+        if self.avoid_arm_after_leave {
+            let home = self.avoid_home.unwrap_or((x, y));
+            let (hrx, hry, hw, hh) = anchor(home.0, home.1);
+            let hdist = point_rect_dist(
+                cx as f32, cy as f32, hrx as f32, hry as f32, hw as f32, hh as f32,
+            );
+            if hdist > trigger * avoid.hysteresis.max(1.0) {
+                self.avoid_arm_after_leave = false;
+            }
+        }
+        // 收起/滑动中,或光标尚未离开(恢复后的挂起期):回避不参与
+        let active = avoid.enabled
+            && !self.hidden
+            && !self.dragging
+            && !self.collapsed
+            && self.collapse_anim.is_none()
+            && !self.avoid_arm_after_leave;
 
         // Disabled (tray toggle / hidden / being dragged): stop dodging and
         // glide anything still displaced back to its remembered home.
@@ -755,15 +963,15 @@ impl App {
             return;
         }
 
-        let trigger = avoid.distance.max(1.0);
         let home = self.avoid_home.unwrap_or((x, y));
+        let (hrx, hry, hw, hh) = anchor(home.0, home.1);
         let hdist = point_rect_dist(
             cx as f32,
             cy as f32,
-            home.0 as f32,
-            home.1 as f32,
-            w as f32,
-            h as f32,
+            hrx as f32,
+            hry as f32,
+            hw as f32,
+            hh as f32,
         );
 
         let should_dodge = hdist < trigger;
@@ -773,7 +981,7 @@ impl App {
                 self.avoid_home = Some((x, y));
             }
             self.avoid_offscreen = true;
-            log_line(&format!("[avoid] dodge start (cursor {}px from home)", hdist.round() as i32));
+            log_line(&format!("[avoid] dodge start (cursor {}px from pet)", hdist.round() as i32));
         } else if self.avoid_offscreen && hdist > trigger * avoid.hysteresis.max(1.0) {
             // cursor left the area (with hysteresis): begin the glide home
             self.avoid_offscreen = false;
@@ -782,11 +990,12 @@ impl App {
 
         let home = self.avoid_home.unwrap_or((x, y));
         if self.avoid_offscreen {
-            // Dodge target: home + `shift` px along (home_center -> cursor).
-            // Anchoring on home keeps the orbiting point reachable, so the pet
-            // settles exactly `shift` away and always returns to home.
-            let hcx = home.0 as f32 + w as f32 / 2.0;
-            let hcy = home.1 as f32 + h as f32 / 2.0;
+            // Dodge target: home + `shift` px along (home_visual_center ->
+            // cursor). Anchoring on home keeps the orbiting point reachable,
+            // so the pet settles exactly `shift` away and always returns home.
+            let (hrx, hry, hw, hh) = anchor(home.0, home.1);
+            let hcx = hrx as f32 + hw as f32 / 2.0;
+            let hcy = hry as f32 + hh as f32 / 2.0;
             let (mut vx, mut vy) = (hcx - cx as f32, hcy - cy as f32);
             let len = (vx * vx + vy * vy).sqrt();
             if len < 1.0 {
@@ -814,6 +1023,172 @@ impl App {
             if nx != x || ny != y {
                 window::set_window_rect(self.hwnd, nx, ny, w, h);
             }
+        }
+    }
+
+    /// 宠物所在显示器的工作区底边(底部任务栏时=任务栏顶边),自动收起的
+    /// 身体裁剪用。任务栏在其它边缘时退化为整屏高度(不裁剪)。
+    fn work_area_bottom(&self) -> i32 {
+        unsafe {
+            let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                mi.rcWork.bottom
+            } else {
+                screen_size().1
+            }
+        }
+    }
+
+    /// 自动收起(auto-hide)状态机(见 config.auto_hide):
+    /// - idle/offline 持续 `after_sec` 秒 → 收起:从原位**向下滑动**到
+    ///   y = 屏幕高度 − y_factor × 窗口高度(se.pxl `slide_speed` 速度,保持置顶,
+    ///   头悬浮在所有窗口之上),到达后身体部分裁剪留透明(任务栏从透明区
+    ///   透出)、透明度再乘 `opacity`、鼠标点击穿透(WS_EX_TRANSPARENT)。
+    /// - 退出:状态离开 idle/offline(新消息)或鼠标悬停超过 `hover_sec` 秒
+    ///   → **滑回原位**。
+    fn update_collapse(&mut self, dt: u64) {
+        let ah = self.cfg.auto_hide.clone();
+        // 滑动动画优先推进(收起/恢复共用;逐帧 move_toward,位置平滑)
+        if let Some((gx, gy)) = self.collapse_anim {
+            let (x, y, w, h) = self.window_size();
+            let speed = if self.collapsed { ah.slide_speed } else { ah.slide_speed.max(1.0) };
+            let ((nx, ny), done) = move_toward((x, y), (gx, gy), speed.max(1.0), dt);
+            if nx != x || ny != y {
+                window::set_window_rect(self.hwnd, nx, ny, w, h);
+            }
+            if done {
+                self.collapse_anim = None;
+                if self.collapsed {
+                    // 到达收起位:启用鼠标穿透
+                    window::set_click_through(self.hwnd, true);
+                    self.dirty_request = true;
+                }
+            }
+        }
+        if self.dragging || self.hidden {
+            return; // 拖拽/全屏隐藏期间不参与
+        }
+        let resting = matches!(self.base_mode, Mode::Idle | Mode::Offline);
+        if self.collapsed {
+            if !resting || !ah.enabled {
+                // 新消息/新活动(或关闭开关):滑回原位
+                self.exit_collapse();
+                return;
+            }
+            if self.collapse_anim.is_some() {
+                return; // 滑动中:等到达后再做悬停/裁剪
+            }
+            // 计算裁剪:被任务栏盖住的身体部分留透明(任务栏从透明区透出),
+            // 头部保持置顶悬浮在所有窗口之上
+            let (_, y, _, h) = self.window_size();
+            let wb = self.work_area_bottom();
+            self.collapse_clip = (h - (wb - y)).clamp(0, h);
+            // 悬停检测:点击穿透后收不到鼠标消息,用光标位置轮询
+            let (cx, cy) = window::cursor_pos();
+            let (wx, wy, ww, wh) = self.window_size();
+            let over = cx >= wx && cx < wx + ww && cy >= wy && cy < wy + wh;
+            if over {
+                self.collapse_hover_since.get_or_insert(now_ms());
+            } else {
+                self.collapse_hover_since = None;
+            }
+            if self
+                .collapse_hover_since
+                .map(|t| now_ms().saturating_sub(t) >= ah.hover_sec.saturating_mul(1000))
+                .unwrap_or(false)
+            {
+                self.exit_collapse();
+            }
+            return;
+        }
+        if !ah.enabled || !resting {
+            self.collapse_idle_since = None;
+            return;
+        }
+        let since = *self.collapse_idle_since.get_or_insert(Instant::now());
+        if since.elapsed().as_secs() >= ah.after_sec {
+            self.enter_collapse();
+        }
+    }
+
+    fn enter_collapse(&mut self) {
+        let (x, y, w, h) = self.window_size();
+        self.collapse_home = Some((x, y));
+        self.collapsed = true;
+        self.collapse_hover_since = None;
+        self.collapse_idle_since = None;
+        // 目标:任务栏区域。保持置顶(头部悬浮在所有窗口之上),身体部分
+        // 到达后通过 draw 裁剪(见 collapse_clip)留透明;先滑动后穿透。
+        let sh = screen_size().1;
+        let yf = self.cfg.auto_hide.y_factor.clamp(0.05, 1.0);
+        let ty = (sh as f32 - yf * h as f32).round() as i32;
+        self.collapse_anim = Some((x, ty));
+        // 收起期间不参与回避模式(位置/穿透冲突)
+        self.avoid_offscreen = false;
+        self.avoid_home = None;
+        self.avoid_arm_after_leave = false;
+        self.dirty_request = true; // 透明度过渡需要重绘
+        log_line(&format!("[auto-hide] sliding down to y={ty}"));
+    }
+
+    fn exit_collapse(&mut self) {
+        if !self.collapsed {
+            return;
+        }
+        self.collapsed = false;
+        self.collapse_hover_since = None;
+        self.collapse_clip = 0;
+        window::set_click_through(self.hwnd, false);
+        if let Some((hx, hy)) = self.collapse_home.take() {
+            // 滑回原位(从当前位置开始)
+            self.collapse_anim = Some((hx, hy));
+            log_line("[auto-hide] sliding home");
+        }
+        // 重新计时,避免刚恢复又立刻收起;
+        // 回避模式挂起,等光标首次离开宠物再武装(否则悬停触发恢复后立刻被躲开)
+        self.collapse_idle_since = Some(Instant::now());
+        self.avoid_arm_after_leave = self.cfg.avoid.enabled;
+        self.dirty_request = true;
+    }
+
+    /// 托盘「自动收起」勾选切换,即时生效并写回 config.json。
+    fn toggle_auto_hide(&mut self) {
+        self.cfg.auto_hide.enabled = !self.cfg.auto_hide.enabled;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        log_line(&format!("[auto-hide] tray toggle -> {}", self.cfg.auto_hide.enabled));
+        if !self.cfg.auto_hide.enabled && self.collapsed {
+            self.exit_collapse();
+        } else if self.cfg.auto_hide.enabled {
+            // 从头计时,避免用旧的 idle 时长立即触发
+            self.collapse_idle_since = Some(Instant::now());
+        }
+    }
+
+    /// Re-scan the loaded animation's first frame for the bbox of non-
+    /// transparent pixels and cache it in `avoid_box` (window-local coords; the
+    /// sprite is drawn at (WINDOW_EXTRA_W, 0) in `compose`). One frame scan per
+    /// animation load — ~sub-ms for an 800px canvas, and nothing per tick.
+    /// Called whenever `self.anim` changes.
+    fn refresh_avoid_box(&mut self) {
+        self.avoid_box = self.anim.as_ref().and_then(|a| {
+            a.frame(0)
+                .alpha_bbox()
+                .map(|(bx, by, bw, bh)| (bx + WINDOW_EXTRA_W as i32, by, bw, bh))
+        });
+    }
+
+    /// Non-transparent pet rect in window-local coords (x_off, y_off, w, h).
+    /// Falls back to the full window rect until an animation bbox is scanned.
+    fn pet_visual_rect(&self) -> (i32, i32, i32, i32) {
+        if let Some(b) = self.avoid_box {
+            b
+        } else {
+            let (_, _, w, h) = self.window_size();
+            (0, 0, w, h)
         }
     }
 
@@ -845,6 +1220,11 @@ impl App {
 
     fn compose(&mut self) {
         let (pet_w, pet_h) = self.pet_size();
+        // 自动收起:身体被任务栏盖住的部分留透明(任务栏从透明区透出)
+        self.comp.clip_bottom = if self.collapsed { self.collapse_clip } else { 0 };
+        // 亚克力截屏需要窗口屏幕原点(compose 每次更新)
+        let (wx, wy, _, _) = self.window_size();
+        self.comp.set_screen_pos(wx, wy);
         // The window is the pet plus a horizontal gutter on the left/right
         // so the phone-style bubble at the top-left has room without
         // crowding the character's face. The pet stays centered in the
@@ -869,31 +1249,15 @@ impl App {
         let pet_y = 0i32;
         let alpha = self.fade_alpha * self.cfg.opacity_for(&self.mode);
 
-        // "behind" mode draws the outlined text FIRST; the phone bubble (the
-        // default) is also composited BEFORE the pet sprite, so the enlarged
-        // bubble may be partially occluded by the body — the pet naturally
-        // covers whatever overlaps it (可以被本体遮挡一部分)。
-        let use_behind = self.cfg.text.mode == "behind";
-        if use_behind {
-            self.text_overlay.layout_if_needed(
-                self.bubble_lines.clone(),
-                pet_w,
-                pet_h,
-                pet_x,
-                pet_y,
-                self.cfg.text.max_lines,
-                &self.comp,
-            );
-            self.text_overlay.draw(&mut self.comp, &self.cfg.text);
-        } else {
-            // phone bubble at the pet's top-left; drawn under the pet, the
-            // right/bottom edge may slip behind the sprite
-            if self.bubble.visible() {
-                let dpi = self.comp.dpi_scale();
-                let bx = bubble::scaled(bubble::BUBBLE_MARGIN_X, dpi) as i32;
-                let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
-                self.bubble.draw(&mut self.comp, bx, by);
-            }
+        // the phone bubble is composited BEFORE the pet sprite, so the
+        // enlarged bubble may be partially occluded by the body — the pet
+        // naturally covers whatever overlaps it (可以被本体遮挡一部分)。
+        if self.bubble.visible() {
+            let dpi = self.comp.dpi_scale();
+            let bx = bubble::scaled(bubble::BUBBLE_MARGIN_X, dpi) as i32
+                + ((1.0 - self.bubble_fade) * 8.0) as i32; // 从宠物方向滑入
+            let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
+            self.bubble.draw(&mut self.comp, bx, by, self.mode, self.bubble_fade);
         }
 
         if self.mode == Mode::Offline {
@@ -943,7 +1307,15 @@ impl App {
     }
 
     pub fn on_lbutton_down(&mut self) {
+        // 若在收起(或滑动中),用户想拖走宠物:取消收起并清掉滑动目标
+        if self.collapsed {
+            self.exit_collapse();
+            self.collapse_anim = None;
+        }
         self.dragging = true;
+        if self.cfg.auto_hide.enabled {
+            self.collapse_idle_since = Some(Instant::now());
+        }
         // the user grabbed the pet: cancel any avoidance; the spot it ends up
         // at after the drag becomes its new implicit home
         self.avoid_offscreen = false;
@@ -960,6 +1332,10 @@ impl App {
 
     pub fn on_mouse_move(&mut self) {
         self.last_interaction = Instant::now();
+        // 鼠标在宠物上活动 = 不是空闲,重新计自动收起的 idle 时长
+        if self.cfg.auto_hide.enabled && !self.collapsed {
+            self.collapse_idle_since = Some(Instant::now());
+        }
         if self.dragging {
             let (cx, cy) = window::cursor_pos();
             let nx0 = self.drag_win.0 + (cx - self.drag_cursor.0);
@@ -980,6 +1356,15 @@ impl App {
         if self.dragging {
             self.dragging = false;
             log_line("[gui] lbutton up (drag end)");
+            // remember the spot the pet was dropped at (config window_pos),
+            // so the next launch restores it instead of the default corner
+            let (x, y, _, _) = self.window_size();
+            if self.cfg.window_pos.x != Some(x) || self.cfg.window_pos.y != Some(y) {
+                self.cfg.window_pos.x = Some(x);
+                self.cfg.window_pos.y = Some(y);
+                let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+                log_line(&format!("[gui] saved window pos ({x}, {y})"));
+            }
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -995,6 +1380,7 @@ impl App {
         }
         self.cfg.display.scale = s;
         let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        self.dirty_request = true;
         // resizing re-anchors the window bottom-right, invalidating any
         // remembered avoid home; the next dodge re-records it
         self.avoid_offscreen = false;
@@ -1007,12 +1393,13 @@ impl App {
 
     pub fn show_tray_menu(&mut self) {
         if let Some(t) = &self.tray {
-            if let Some(cmd) = t.show_menu(self.cfg.avoid.enabled) {
+            if let Some(cmd) = t.show_menu(self.cfg.avoid.enabled, self.cfg.auto_hide.enabled) {
                 match cmd {
                     tray::MENU_QUIT => unsafe {
                         PostQuitMessage(0);
                     },
                     tray::MENU_AVOID_TOGGLE => self.toggle_avoid(),
+                    tray::MENU_AUTOHIDE_TOGGLE => self.toggle_auto_hide(),
                     _ => {}
                 }
             }

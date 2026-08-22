@@ -77,6 +77,7 @@ impl DshConnector {
     }
 
     fn poll_loop(&self, health: Arc<Mutex<Health>>, tx: Sender<StateEvent>, stop: Arc<AtomicBool>) {
+        let mut last_err: Option<String> = None;
         let mut seq = 0u64;
         let mut url = Url::parse(&self.url).unwrap_or_else(|_| Url {
             host: "127.0.0.1".into(),
@@ -92,9 +93,13 @@ impl DshConnector {
                         h.poll_ok = true;
                     }
                     send(&tx, StateEvent::Poll { source: Source::Dsh, items, ok: true, error: None });
+                    last_err = None;
                 }
                 Err(e) => {
-                    eprintln!("[dsh] poll error: {e}");
+                    if last_err.as_deref() != Some(e.as_str()) {
+                        eprintln!("[dsh] poll error: {e}");
+                        last_err = Some(e.clone());
+                    }
                     if let Ok(mut h) = health.lock() {
                         h.poll_ok = false;
                     }
@@ -185,6 +190,12 @@ fn fetch_sessions(url: &mut Url, seq: u64) -> Result<Vec<SessionItem>, String> {
 // ---------------------------------------------------------------------------
 
 const HISTORY_MAX_MESSAGES: u64 = 2;
+/// Baseline window for the FIRST poll of a session: it must reach far
+/// enough back to include the open turn's `turn/start` and any open tool
+/// calls. A too-small window (2 messages) only sees the tail of a long
+/// running session, so the pet would never learn that the session is
+/// thinking/working — it only appears when it finally ends.
+const HISTORY_MAX_MESSAGES_BASELINE: u64 = 200;
 /// extra cycles a just-stopped session stays polled (to catch the final
 /// turn/end event that may land after `running` flips to false)
 const GRACE_CYCLES: u32 = 3;
@@ -198,7 +209,243 @@ struct HistoryState {
     recent: HashMap<String, u32>,
 }
 
+/// Apply one history batch for a session and return the StateEvents to emit.
+///
+/// First batch (baseline, big window): reconstruct the session's CURRENT
+/// state — the open turn (from its `turn/start`, or inferred from any
+/// event's `data.turn` as long as that turn did not end inside the window),
+/// open tool calls, todos and the last user message — WITHOUT replaying live
+/// text or turn endings (a replayed ending would stamp `last_end` with the
+/// pet's wall clock and fake a done/fail burst).
+///
+/// Later batches (small window): emit the delta (seq > last_seq), including
+/// live text and endings.
+fn apply_history_events(session_id: &str, entries: &[Value], st: &mut HistoryState) -> Vec<StateEvent> {
+    let seeded = st.last_seq.contains_key(session_id);
+    let mut max_seq = st.last_seq.get(session_id).copied().unwrap_or(0);
+    let mut evs: Vec<StateEvent> = Vec::new();
+    let mut live_reasoning = String::new();
+    let mut live_text = String::new();
+    if !seeded {
+        // ---- baseline: reconstruct the CURRENT state ----
+        let mut open_turn: Option<u64> = None;
+        for entry in entries {
+            let ev = &entry["event"];
+            let ev_seq = ev["seq"].as_u64().unwrap_or(0);
+            if ev_seq > max_seq {
+                max_seq = ev_seq;
+            }
+            if ev_seq <= st.last_seq.get(session_id).copied().unwrap_or(0) {
+                continue;
+            }
+            let data = &ev["data"];
+            let t = ev["type"].as_str().unwrap_or("");
+            if t == "turn/start" {
+                open_turn = data["turn"].as_u64();
+                continue;
+            }
+            if t == "turn/end" {
+                if data["turn"].as_u64() == open_turn {
+                    open_turn = None;
+                }
+                continue;
+            }
+            // any event carrying a turn number hints the open turn when its
+            // start event has left the window
+            if open_turn.is_none() {
+                open_turn = data["turn"].as_u64();
+            }
+            match t {
+                "tool/call" => {
+                    // only tools of the open turn are live; tools of a turn
+                    // that ended inside the window are closed (a missing
+                    // turn field is treated as the current turn)
+                    let tool_turn = data["turn"].as_u64();
+                    if open_turn.is_none() || tool_turn.is_none() || tool_turn == open_turn {
+                        let call_id = data["callId"].as_str().unwrap_or("").to_string();
+                        let name = data["name"].as_str().unwrap_or("tool").to_string();
+                        let arguments = data["arguments"].as_str().map(|a| a.to_string());
+                        st.open_calls.entry(session_id.to_string()).or_default().push((call_id, name.clone()));
+                        evs.push(StateEvent::ToolStarted {
+                            source: Source::Dsh,
+                            session_id: session_id.to_string(),
+                            name,
+                            arguments,
+                        });
+                    }
+                }
+                "tool/result" => {
+                    // close only calls whose start was emitted in this batch
+                    let call_id = data["message"]["source"]["callId"].as_str().unwrap_or("");
+                    if let Some(name) = st.open_calls.get_mut(session_id).and_then(|calls| {
+                        let idx = calls.iter().position(|(id, _)| id == call_id);
+                        idx.map(|i| calls.remove(i).1)
+                    }) {
+                        evs.push(StateEvent::ToolEnded {
+                            source: Source::Dsh,
+                            session_id: session_id.to_string(),
+                            name,
+                            error: data.get("error").is_some(),
+                        });
+                    }
+                }
+                "todo/write" => {
+                    let todos = data["todos"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| {
+                                    Some(TodoItem {
+                                        content: t["content"].as_str()?.to_string(),
+                                        status: t["status"].as_str().unwrap_or("pending").to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    evs.push(StateEvent::TodoSnapshot {
+                        source: Source::Dsh,
+                        session_id: session_id.to_string(),
+                        todos,
+                    });
+                }
+                "user/message" => {
+                    let text = message_text(data);
+                    if !text.is_empty() {
+                        evs.push(StateEvent::UserMessage {
+                            source: Source::Dsh,
+                            session_id: session_id.to_string(),
+                            text,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(turn) = open_turn {
+            evs.push(StateEvent::TurnStarted {
+                source: Source::Dsh,
+                session_id: session_id.to_string(),
+                turn,
+            });
+        }
+    } else {
+        // ---- delta: everything new since last_seq ----
+        for entry in entries {
+            let ev = &entry["event"];
+            let ev_seq = ev["seq"].as_u64().unwrap_or(0);
+            if ev_seq > max_seq {
+                max_seq = ev_seq;
+            }
+            if ev_seq <= st.last_seq.get(session_id).copied().unwrap_or(0) {
+                continue;
+            }
+            let data = &ev["data"];
+            match ev["type"].as_str().unwrap_or("") {
+                "turn/start" => {
+                    evs.push(StateEvent::TurnStarted {
+                        source: Source::Dsh,
+                        session_id: session_id.to_string(),
+                        turn: data["turn"].as_u64().unwrap_or(0),
+                    });
+                }
+                "turn/end" => {
+                    let kind = data["reason"]["kind"].as_str().unwrap_or("");
+                    let reason = TurnEndReason::from_dsh_kind(kind).unwrap_or(TurnEndReason::Aborted);
+                    evs.push(StateEvent::TurnEnded {
+                        source: Source::Dsh,
+                        session_id: session_id.to_string(),
+                        turn: data["turn"].as_u64().unwrap_or(0),
+                        reason,
+                    });
+                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
+                }
+                "tool/call" => {
+                    let call_id = data["callId"].as_str().unwrap_or("").to_string();
+                    let name = data["name"].as_str().unwrap_or("tool").to_string();
+                    let arguments = data["arguments"].as_str().map(|a| a.to_string());
+                    st.open_calls.entry(session_id.to_string()).or_default().push((call_id, name.clone()));
+                    evs.push(StateEvent::ToolStarted {
+                        source: Source::Dsh,
+                        session_id: session_id.to_string(),
+                        name,
+                        arguments,
+                    });
+                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
+                }
+                "tool/result" => {
+                    let call_id = data["message"]["source"]["callId"].as_str().unwrap_or("");
+                    let name = st
+                        .open_calls
+                        .get_mut(session_id)
+                        .and_then(|calls| {
+                            let idx = calls.iter().position(|(id, _)| id == call_id);
+                            idx.map(|i| calls.remove(i).1)
+                        })
+                        .unwrap_or_else(|| "tool".to_string());
+                    let error = data.get("error").is_some();
+                    evs.push(StateEvent::ToolEnded {
+                        source: Source::Dsh,
+                        session_id: session_id.to_string(),
+                        name,
+                        error,
+                    });
+                }
+                "todo/write" => {
+                    let todos = data["todos"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| {
+                                    Some(TodoItem {
+                                        content: t["content"].as_str()?.to_string(),
+                                        status: t["status"].as_str().unwrap_or("pending").to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    evs.push(StateEvent::TodoSnapshot {
+                        source: Source::Dsh,
+                        session_id: session_id.to_string(),
+                        todos,
+                    });
+                }
+                "assistant/chunk" => {
+                    let chunk = &data["chunk"];
+                    let ctype = chunk.get("type").and_then(Value::as_str).unwrap_or("");
+                    let text = chunk.get("text").and_then(Value::as_str).unwrap_or("");
+                    match ctype {
+                        "reasoning-delta" => live_reasoning.push_str(text),
+                        "text-delta" => live_text.push_str(text),
+                        _ => {}
+                    }
+                }
+                "user/message" => {
+                    let text = message_text(data);
+                    if !text.is_empty() {
+                        evs.push(StateEvent::UserMessage {
+                            source: Source::Dsh,
+                            session_id: session_id.to_string(),
+                            text,
+                        });
+                    }
+                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
+                }
+                "assistant/message" | "step/end" => {
+                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
+                }
+                _ => {}
+            }
+        }
+        flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
+    }
+    st.last_seq.insert(session_id.to_string(), max_seq);
+    evs
+}
+
 fn history_loop(url_str: &str, history_ms: u64, tx: Sender<StateEvent>, stop: Arc<AtomicBool>) {
+    let mut hist_err: Option<String> = None;
     let mut url = Url::parse(url_str).unwrap();
     let seq = AtomicU64::new(1);
     let mut st = HistoryState {
@@ -234,11 +481,19 @@ fn history_loop(url_str: &str, history_ms: u64, tx: Sender<StateEvent>, stop: Ar
                     }
                     let n2 = seq.fetch_add(1, Ordering::Relaxed);
                     if let Err(e) = poll_history(&mut url, &id, n2, &mut st, &tx) {
-                        eprintln!("[dsh] history {id}: {e}");
+                        if hist_err.as_deref() != Some(e.as_str()) {
+                            eprintln!("[dsh] history {id}: {e}");
+                            hist_err = Some(e);
+                        }
                     }
                 }
             }
-            Err(e) => eprintln!("[dsh] history session list: {e}"),
+            Err(e) => {
+                if hist_err.as_deref() != Some(e.as_str()) {
+                    eprintln!("[dsh] history session list: {e}");
+                    hist_err = Some(e.clone());
+                }
+            }
         }
         let elapsed = t0.elapsed().as_millis() as u64;
         sleep_interruptible(interval.saturating_sub(elapsed), &stop);
@@ -255,11 +510,19 @@ fn poll_history(
     tx: &Sender<StateEvent>,
 ) -> Result<(), String> {
     url.path = "/api/session.history".into();
+    // the FIRST poll of a session uses the big baseline window so the
+    // current state (open turn / tools) can be reconstructed even for a
+    // session that has been running for a while
+    let max_messages = if st.last_seq.contains_key(session_id) {
+        HISTORY_MAX_MESSAGES
+    } else {
+        HISTORY_MAX_MESSAGES_BASELINE
+    };
     let envelope = serde_json::json!({
         "type": "client-request",
         "rpcId": format!("pet-{seq}"),
         "method": "session.history",
-        "payload": { "sessionId": session_id, "maxMessages": HISTORY_MAX_MESSAGES }
+        "payload": { "sessionId": session_id, "maxMessages": max_messages }
     });
     let resp = request(
         url,
@@ -279,164 +542,7 @@ fn poll_history(
     }
     let entries = result["value"]["events"].as_array().cloned().unwrap_or_default();
 
-    let seeded = st.last_seq.contains_key(session_id);
-    let mut max_seq = st.last_seq.get(session_id).copied().unwrap_or(0);
-    let mut evs: Vec<StateEvent> = Vec::new();
-    let mut live_reasoning = String::new();
-    let mut live_text = String::new();
-
-    for entry in &entries {
-        let ev = &entry["event"];
-        let ev_seq = ev["seq"].as_u64().unwrap_or(0);
-        if ev_seq > max_seq {
-            max_seq = ev_seq;
-        }
-        if ev_seq <= st.last_seq.get(session_id).copied().unwrap_or(0) {
-            continue; // already applied
-        }
-        let data = &ev["data"];
-        if !seeded {
-            // baseline pass: establish the session's CURRENT state (active
-            // turn / running tool / todos) without replaying text or endings
-            match ev["type"].as_str().unwrap_or("") {
-                "turn/start" => evs.push(StateEvent::TurnStarted {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    turn: data["turn"].as_u64().unwrap_or(0),
-                }),
-                "tool/call" => {
-                    let call_id = data["callId"].as_str().unwrap_or("").to_string();
-                    let name = data["name"].as_str().unwrap_or("tool").to_string();
-                    let arguments = data["arguments"].as_str().map(|a| a.to_string());
-                    st.open_calls.entry(session_id.to_string()).or_default().push((call_id, name.clone()));
-                    evs.push(StateEvent::ToolStarted {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        name,
-                        arguments,
-                    });
-                }
-                "todo/write" => {
-                    let todos = data["todos"].as_array().map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| {
-                                Some(TodoItem {
-                                    content: t["content"].as_str()?.to_string(),
-                                    status: t["status"].as_str().unwrap_or("pending").to_string(),
-                                })
-                            })
-                            .collect()
-                    }).unwrap_or_default();
-                    evs.push(StateEvent::TodoSnapshot {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        todos,
-                    });
-                }
-                _ => {}
-            }
-            continue;
-        }
-        match ev["type"].as_str().unwrap_or("") {
-            "turn/start" => {
-                evs.push(StateEvent::TurnStarted {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    turn: data["turn"].as_u64().unwrap_or(0),
-                });
-            }
-            "turn/end" => {
-                let kind = data["reason"]["kind"].as_str().unwrap_or("");
-                let reason = TurnEndReason::from_dsh_kind(kind).unwrap_or(TurnEndReason::Aborted);
-                evs.push(StateEvent::TurnEnded {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    turn: data["turn"].as_u64().unwrap_or(0),
-                    reason,
-                });
-                flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-            }
-            "tool/call" => {
-                let call_id = data["callId"].as_str().unwrap_or("").to_string();
-                let name = data["name"].as_str().unwrap_or("tool").to_string();
-                let arguments = data["arguments"].as_str().map(|a| a.to_string());
-                st.open_calls.entry(session_id.to_string()).or_default().push((call_id, name.clone()));
-                evs.push(StateEvent::ToolStarted {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    name,
-                    arguments,
-                });
-                flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-            }
-            "tool/result" => {
-                let call_id = data["message"]["source"]["callId"].as_str().unwrap_or("");
-                let name = st
-                    .open_calls
-                    .get_mut(session_id)
-                    .and_then(|calls| {
-                        let idx = calls.iter().position(|(id, _)| id == call_id);
-                        idx.map(|i| calls.remove(i).1)
-                    })
-                    .unwrap_or_else(|| "tool".to_string());
-                let error = data.get("error").is_some();
-                evs.push(StateEvent::ToolEnded {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    name,
-                    error,
-                });
-            }
-            "todo/write" => {
-                let todos = data["todos"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| {
-                                Some(TodoItem {
-                                    content: t["content"].as_str()?.to_string(),
-                                    status: t["status"].as_str().unwrap_or("pending").to_string(),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                evs.push(StateEvent::TodoSnapshot {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    todos,
-                });
-            }
-            "assistant/chunk" => {
-                let chunk = &data["chunk"];
-                let ctype = chunk.get("type").and_then(Value::as_str).unwrap_or("");
-                let text = chunk.get("text").and_then(Value::as_str).unwrap_or("");
-                match ctype {
-                    "reasoning-delta" => live_reasoning.push_str(text),
-                    "text-delta" => live_text.push_str(text),
-                    _ => {}
-                }
-            }
-            "user/message" => {
-                let text = message_text(data);
-                if !text.is_empty() {
-                    evs.push(StateEvent::UserMessage {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        text,
-                    });
-                }
-                flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-            }
-            "assistant/message" | "step/end" => {
-                flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-            }
-            _ => {}
-        }
-    }
-
-    st.last_seq.insert(session_id.to_string(), max_seq);
-    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
+    let evs = apply_history_events(session_id, &entries, st);
     for ev in evs {
         send(tx, ev);
     }
@@ -492,6 +598,7 @@ fn stream_loop(
     handler: fn(&mut StreamCtx, &str) -> Option<Vec<StateEvent>>,
 ) {
     let mut url = Url::parse(base_url).unwrap();
+    let mut stream_err: Option<String> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -505,6 +612,17 @@ fn stream_loop(
                     h.last_frame = Instant::now();
                 }
                 eprintln!("[dsh] {name} connected");
+                stream_err = None;
+                if name == "mux" {
+                    // Reconcile pending requests with the server: right after
+                    // connect the server replays its CURRENT pending
+                    // questions/approvals, so drop our local copies first —
+                    // anything the server no longer knows about (crash /
+                    // restart, a resolved frame missed during a WS blip)
+                    // must not keep the pet in attention forever, and the
+                    // replay re-adds what is still genuinely pending.
+                    send(&tx, StateEvent::PendingSync { source: Source::Dsh });
+                }
                 let mut ctx = StreamCtx::default();
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -529,14 +647,21 @@ fn stream_loop(
                         }
                         Err(WsError::Timeout) => {}
                         Err(e) => {
-                            eprintln!("[dsh] {name} stream error: {e}, reconnecting");
+                            let msg = e.to_string();
+                            if stream_err.as_deref() != Some(msg.as_str()) {
+                                eprintln!("[dsh] {name} stream error: {msg}, reconnecting");
+                                stream_err = Some(msg);
+                            }
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[dsh] {name} connect failed: {e}");
+                if stream_err.as_deref() != Some(e.as_str()) {
+                    eprintln!("[dsh] {name} connect failed: {e}");
+                    stream_err = Some(e.clone());
+                }
             }
         }
         sleep_interruptible(3000, &stop);
@@ -783,126 +908,16 @@ mod tests {
         )
     }
 
-    /// Run entries through the same parsing loop used by poll_history,
-    /// without network: returns the emitted events and final last_seq.
+    /// Run entries through the real parsing loop used by poll_history,
+    /// without network: returns the emitted events and the final last_seq.
     fn parse_events(
         session_id: &str,
         entries: Vec<Value>,
         st: &mut HistoryState,
     ) -> (Vec<StateEvent>, u64) {
-        let seeded = st.last_seq.contains_key(session_id);
-        let mut max_seq = st.last_seq.get(session_id).copied().unwrap_or(0);
-        let mut evs = Vec::new();
-        let mut live_reasoning = String::new();
-        let mut live_text = String::new();
-        for entry in &entries {
-            let ev = &entry["event"];
-            let ev_seq = ev["seq"].as_u64().unwrap_or(0);
-            if ev_seq > max_seq {
-                max_seq = ev_seq;
-            }
-            if ev_seq <= st.last_seq.get(session_id).copied().unwrap_or(0) {
-                continue;
-            }
-            let data = &ev["data"];
-            if !seeded {
-                match ev["type"].as_str().unwrap_or("") {
-                    "turn/start" => evs.push(StateEvent::TurnStarted {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        turn: data["turn"].as_u64().unwrap_or(0),
-                    }),
-                    "tool/call" => {
-                        let call_id = data["callId"].as_str().unwrap_or("").to_string();
-                        let name = data["name"].as_str().unwrap_or("tool").to_string();
-                        let arguments = data["arguments"].as_str().map(|a| a.to_string());
-                        st.open_calls.entry(session_id.to_string()).or_default().push((call_id, name.clone()));
-                        evs.push(StateEvent::ToolStarted {
-                            source: Source::Dsh,
-                            session_id: session_id.to_string(),
-                            name,
-                            arguments,
-                        });
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            match ev["type"].as_str().unwrap_or("") {
-                "turn/start" => evs.push(StateEvent::TurnStarted {
-                    source: Source::Dsh,
-                    session_id: session_id.to_string(),
-                    turn: data["turn"].as_u64().unwrap_or(0),
-                }),
-                "turn/end" => {
-                    let kind = data["reason"]["kind"].as_str().unwrap_or("");
-                    evs.push(StateEvent::TurnEnded {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        turn: data["turn"].as_u64().unwrap_or(0),
-                        reason: TurnEndReason::from_dsh_kind(kind).unwrap_or(TurnEndReason::Aborted),
-                    });
-                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-                }
-                "tool/call" => {
-                    let call_id = data["callId"].as_str().unwrap_or("").to_string();
-                    let name = data["name"].as_str().unwrap_or("tool").to_string();
-                    let arguments = data["arguments"].as_str().map(|a| a.to_string());
-                    st.open_calls.entry(session_id.to_string()).or_default().push((call_id, name.clone()));
-                    evs.push(StateEvent::ToolStarted {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        name,
-                        arguments,
-                    });
-                }
-                "tool/result" => {
-                    let call_id = data["message"]["source"]["callId"].as_str().unwrap_or("");
-                    let name = st
-                        .open_calls
-                        .get_mut(session_id)
-                        .and_then(|calls| {
-                            let idx = calls.iter().position(|(id, _)| id == call_id);
-                            idx.map(|i| calls.remove(i).1)
-                        })
-                        .unwrap_or_else(|| "tool".to_string());
-                    evs.push(StateEvent::ToolEnded {
-                        source: Source::Dsh,
-                        session_id: session_id.to_string(),
-                        name,
-                        error: data.get("error").is_some(),
-                    });
-                }
-                "assistant/chunk" => {
-                    let chunk = &data["chunk"];
-                    let ctype = chunk.get("type").and_then(Value::as_str).unwrap_or("");
-                    let text = chunk.get("text").and_then(Value::as_str).unwrap_or("");
-                    match ctype {
-                        "reasoning-delta" => live_reasoning.push_str(text),
-                        "text-delta" => live_text.push_str(text),
-                        _ => {}
-                    }
-                }
-                "user/message" => {
-                    let text = message_text(data);
-                    if !text.is_empty() {
-                        evs.push(StateEvent::UserMessage {
-                            source: Source::Dsh,
-                            session_id: session_id.to_string(),
-                            text,
-                        });
-                    }
-                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-                }
-                "assistant/message" | "step/end" => {
-                    flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-                }
-                _ => {}
-            }
-        }
-        st.last_seq.insert(session_id.to_string(), max_seq);
-        flush_live(&mut evs, session_id, &mut live_reasoning, &mut live_text);
-        (evs, max_seq)
+        let evs = apply_history_events(session_id, &entries, st);
+        let last = st.last_seq.get(session_id).copied().unwrap_or(0);
+        (evs, last)
     }
 
     #[test]
@@ -912,23 +927,27 @@ mod tests {
             open_calls: HashMap::new(),
             recent: HashMap::new(),
         };
-        // poll 1: baseline (seeding) - live text is NOT emitted
+        // poll 1: baseline - live text is NOT replayed, but the open turn is
+        // reconstructed from the chunk turn numbers (its start left the
+        // small window; this is the mid-run discovery fix)
         let (evs, _) = parse_events("s1", vec![chunk(100, "reasoning-delta", "旧内容"), chunk(101, "text-delta", "old")], &mut st);
-        assert!(evs.is_empty());
-        // seeding also establishes state: turn/start + tool/call are applied
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], StateEvent::TurnStarted { turn: 1, .. }));
+        // seeding also establishes state from the window: an open tool is
+        // applied, but a turn that STARTED and ENDED inside the window is
+        // not replayed (it would leave a phantom open turn)
         let mut st2 = HistoryState { last_seq: HashMap::new(), open_calls: HashMap::new(), recent: HashMap::new() };
         let (evs, _) = parse_events(
             "s1",
             vec![
                 entry(1, json!({"type":"turn/start","data":{"turn":3}})),
-                entry(2, json!({"type":"tool/call","data":{"callId":"c9","name":"bash"}})),
+                entry(2, json!({"type":"tool/call","data":{"turn":3,"callId":"c9","name":"bash"}})),
                 entry(3, json!({"type":"turn/end","data":{"turn":3,"reason":{"kind":"completed"}}})),
             ],
             &mut st2,
         );
-        assert!(matches!(&evs[0], StateEvent::TurnStarted { turn: 3, .. }));
-        assert!(matches!(&evs[1], StateEvent::ToolStarted { name, .. } if name == "bash"));
-        assert_eq!(evs.len(), 2); // turn/end NOT replayed
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], StateEvent::ToolStarted { name, .. } if name == "bash"));
         // poll 2: new deltas stream in
         let (evs, _) = parse_events(
             "s1",
@@ -949,6 +968,78 @@ mod tests {
             &mut st,
         );
         assert!(matches!(&evs[0], StateEvent::LiveText { text, .. } if text.as_deref() == Some(" more")));
+    }
+
+    #[test]
+    fn baseline_recovers_midrun_session() {
+        // a session discovered mid-run: turn/start is far outside the small
+        // window, the tail only has chunks of turn 5 + an open tool call —
+        // the baseline must reconstruct BOTH the open turn and the tool
+        let mut st = HistoryState {
+            last_seq: HashMap::new(),
+            open_calls: HashMap::new(),
+            recent: HashMap::new(),
+        };
+        let (evs, last) = parse_events(
+            "s1",
+            vec![
+                entry(5000, json!({"type":"assistant/chunk","data":{"turn":5,"step":9,"chunk":{"type":"text-delta","text":"正在生成"}}})),
+                entry(5001, json!({"type":"tool/call","data":{"turn":5,"step":9,"callId":"c9","name":"bash","arguments":"{}"}})),
+            ],
+            &mut st,
+        );
+        assert_eq!(last, 5001);
+        assert!(matches!(&evs[0], StateEvent::ToolStarted { name, .. } if name == "bash"));
+        assert!(matches!(&evs[1], StateEvent::TurnStarted { turn: 5, .. }));
+        // no live text is replayed from the baseline window
+        assert!(!evs.iter().any(|e| matches!(e, StateEvent::LiveText { .. })));
+        // the delta pass then only carries NEW seqs
+        let (evs, _) = parse_events("s1", vec![chunk(5002, "text-delta", "新内容")], &mut st);
+        assert!(matches!(&evs[0], StateEvent::LiveText { text, .. } if text.as_deref() == Some("新内容")));
+    }
+
+    #[test]
+    fn baseline_skips_turn_that_ended_in_window() {
+        // turn 5 started outside the window; its chunks and its end are
+        // inside -> the turn is NOT reconstructed (no phantom open turn)
+        let mut st = HistoryState {
+            last_seq: HashMap::new(),
+            open_calls: HashMap::new(),
+            recent: HashMap::new(),
+        };
+        let (evs, _) = parse_events(
+            "s1",
+            vec![
+                entry(10, json!({"type":"assistant/chunk","data":{"turn":5,"step":1,"chunk":{"type":"text-delta","text":"x"}}})),
+                entry(11, json!({"type":"turn/end","data":{"turn":5,"reason":{"kind":"completed"}}})),
+            ],
+            &mut st,
+        );
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn baseline_net_closes_tools_completed_in_window() {
+        // tool/call + tool/result both inside the baseline window: the tool
+        // starts and ends in the same batch (net closed), and the turn that
+        // carried it is reconstructed
+        let mut st = HistoryState {
+            last_seq: HashMap::new(),
+            open_calls: HashMap::new(),
+            recent: HashMap::new(),
+        };
+        let (evs, _) = parse_events(
+            "s1",
+            vec![
+                entry(1, json!({"type":"tool/call","data":{"turn":7,"step":1,"callId":"c1","name":"bash"}})),
+                entry(2, json!({"type":"tool/result","data":{"turn":7,"step":1,"message":{"source":{"callId":"c1"}}}})),
+            ],
+            &mut st,
+        );
+        assert!(matches!(&evs[0], StateEvent::ToolStarted { name, .. } if name == "bash"));
+        assert!(matches!(&evs[1], StateEvent::ToolEnded { name, .. } if name == "bash"));
+        assert!(matches!(&evs[2], StateEvent::TurnStarted { turn: 7, .. }));
+        assert_eq!(evs.len(), 3);
     }
 
     #[test]

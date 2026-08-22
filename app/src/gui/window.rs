@@ -134,6 +134,20 @@ pub fn set_window_rect(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     }
 }
 
+/// 鼠标点击穿透:WS_EX_TRANSPARENT + 分层窗口让鼠标事件全部穿过宠物
+/// (自动收起状态下可正常操作其下方的任务栏/桌面)。
+pub fn set_click_through(hwnd: HWND, on: bool) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let style = if on {
+            style | WS_EX_TRANSPARENT.0
+        } else {
+            style & !WS_EX_TRANSPARENT.0
+        };
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
+    }
+}
+
 pub fn show(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -153,6 +167,8 @@ pub fn instance() -> HINSTANCE {
     unsafe { GetModuleHandleW(None).map(|h| HINSTANCE(h.0)).unwrap_or(HINSTANCE::default()) }
 }
 
+/// DWM 系统毛玻璃已弃用:分层窗口上 Win11 要么静默失效,要么把白色渐变
+/// 刷满整窗(气泡玻璃由软件亚克力实现,见 render::draw_acrylic_fill)。
 pub fn cursor_pos() -> (i32, i32) {
     unsafe {
         let mut p = POINT::default();

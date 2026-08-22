@@ -1,6 +1,6 @@
-//! Ground-truth decode check for candidate webp assets using the app's own
-//! loader (dshpet::anim::load_webp / load_loop_animation), mirroring what
-//! app/src/gui/mod.rs does at startup.
+//! Ground-truth decode check for shipped sprite sheets using the app's own
+//! loader (dshpet::anim::load_animation / load_loop_animation), mirroring
+//! what app/src/gui/mod.rs does at startup.
 //! Usage: cargo run --example check_assets -- <dir>
 use dshpet::anim::{load_animation, load_loop_animation};
 use std::collections::BTreeSet;
@@ -14,12 +14,12 @@ fn main() {
     let mut any_fail = false;
     for state in states {
         let t0 = Instant::now();
-        let path = dir.join(format!("{state}.webp"));
+        let path = dir.join(format!("{state}.sheet.json"));
         if !path.exists() {
             println!("{state:12} MISSING {path:?}");
             continue;
         }
-        match load_animation(dir, state, 1.0, "false") {
+        match load_animation(dir, state, 1.0, 42) {
             Ok(a) => {
                 let f0 = a.frame(0);
                 let dims: BTreeSet<(u32, u32)> = a.frames.iter().map(|f| (f.w, f.h)).collect();
@@ -37,10 +37,11 @@ fn main() {
                     "{state:12}     alpha: fully_transparent={} opaque={} of {n} px  first_frame_corners=[{:?},{:?}]",
                     alpha0, opaque, &corner[..4], &corner[4..8]
                 );
-                let lo = a.durations_ms.iter().min().copied().unwrap_or(0);
-                let hi = a.durations_ms.iter().max().copied().unwrap_or(0);
-                println!("{state:12}     durations: min={lo} max={hi} ms");
-                let loop_anim = load_loop_animation(dir, state, 1.0, "false");
+                println!(
+                    "{state:12}     durations: uniform {} ms (frame_ms)",
+                    a.durations_ms.first().copied().unwrap_or(0)
+                );
+                let loop_anim = load_loop_animation(dir, state, 1.0, 42);
                 println!("{state:12}     _loop asset: {}", if loop_anim.is_some() { "present" } else { "none -> tail-loop fallback" });
             }
             Err(e) => {

@@ -9,15 +9,41 @@ pub enum Source {
     #[default]
     Dsh,
     Hermes,
-    ComfyUi,
+    /// User-provided Lua scripts (connectors/lua.rs): id = registration index.
+    Script(u16),
+}
+
+/// Script source labels: id -> display name (registered at spawn). A global
+/// registry because `Source` is Copy and must stay enum-only.
+static SCRIPT_LABELS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+
+pub fn register_script_label(id: u16, label: String) {
+    let m = SCRIPT_LABELS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut g) = m.lock() {
+        let i = id as usize;
+        if g.len() <= i {
+            g.resize(i + 1, String::new());
+        }
+        g[i] = label;
+    }
+}
+
+pub fn script_label(id: u16) -> String {
+    let m = SCRIPT_LABELS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    m.lock()
+        .ok()
+        .and_then(|g| g.get(id as usize).cloned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("Script {id}"))
 }
 
 impl Source {
-    pub fn label(&self) -> &'static str {
+    /// Display name used in the bubble ("From <name>") and debug output.
+    pub fn label(&self) -> String {
         match self {
-            Source::Dsh => "DSH",
-            Source::Hermes => "Hermes",
-            Source::ComfyUi => "ComfyUI",
+            Source::Dsh => "DSH".to_string(),
+            Source::Hermes => "Hermes".to_string(),
+            Source::Script(id) => script_label(*id),
         }
     }
 }
@@ -52,7 +78,7 @@ impl Mode {
         }
     }
 
-    /// Animation asset name (resource/<name>.webp). Offline is composited.
+    /// Animation asset name (resource/<name>.sheet). Offline is composited.
     pub fn asset(&self) -> &'static str {
         match self {
             Mode::Offline => "idle",
@@ -140,6 +166,12 @@ pub enum StateEvent {
     ApprovalResolved { source: Source, id: String },
     QuestionRequested { source: Source, id: String, session_id: String, text: String },
     QuestionResolved { source: Source, id: String },
+    /// The mux stream (re)connected: the server replays its CURRENT pending
+    /// requests right after connect. Clear local copies for that source so
+    /// requests the server no longer knows about (server crash/restart, or a
+    /// missed resolved frame during a WS blip) cannot keep the pet in
+    /// attention forever — the replay re-adds what is still genuinely pending.
+    PendingSync { source: Source },
     /// Throttled realtime model output (DSH chunk aggregation / Hermes poll delta).
     LiveText { source: Source, session_id: String, reasoning: Option<String>, text: Option<String>, tool_name: Option<String> },
     /// A user-role message (task prompt fallback for done/failed bubbles).
@@ -160,6 +192,8 @@ struct SessionState {
     turns: u32,
     tools: BTreeSet<String>,
     tool_args: BTreeMap<String, String>,
+    /// tool name -> when it started (now_ms), for "who is actually working".
+    tool_since: BTreeMap<String, u64>,
     last_user_text: Option<String>,
     waiting_user: bool,
     last_end: Option<(TurnEndReason, u64)>,
@@ -178,6 +212,7 @@ struct PendingApproval {
     session_id: String,
     tool: String,
     at_ms: u64,
+    source: Source,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +220,7 @@ struct PendingQuestion {
     session_id: String,
     text: String,
     at_ms: u64,
+    source: Source,
 }
 
 /// Per-session live text cap (keeps memory bounded on long generations).
@@ -242,6 +278,10 @@ pub struct Snapshot {
     pub queue_len: u32,
     pub done_sound_pending: bool,
     pub fail_sound_pending: bool,
+    /// session_id -> earliest start time of its currently open tools.
+    /// Bubble tie-break: "谁在干活显示谁" — the session deepest into a task
+    /// wins over one that merely started a short tool.
+    pub working_since: BTreeMap<String, u64>,
 }
 
 pub struct PetState {
@@ -313,6 +353,7 @@ impl PetState {
                         }
                         s.turns = 0;
                         s.tools.clear();
+                        s.tool_since.clear();
                         s.running = false;
                     } else {
                         s.running = true;
@@ -360,6 +401,7 @@ impl PetState {
                         }
                         s.turns = 0;
                         s.tools.clear();
+                        s.tool_since.clear();
                     }
                 }
                 if any_done {
@@ -401,34 +443,42 @@ impl PetState {
                 let _ = blocked;
             }
             StateEvent::ToolStarted { source, session_id, name, arguments, .. } => {
+                let now = self.now_ms;
                 let s = self.session_mut(source, &session_id);
                 s.tools.insert(name.clone());
                 if let Some(args) = arguments {
-                    s.tool_args.insert(name, args);
+                    s.tool_args.insert(name.clone(), args);
                 }
+                s.tool_since.insert(name.clone(), now);
                 s.running = true;
+                // A tool run is a new work phase: drop the pre-tool stream so
+                // the Working bubble shows the actual work (⚙ tool label, or
+                // fresh text streamed after the tool started) instead of the
+                // stale thinking/output text from before the call.
+                s.live = LiveText::default();
             }
             StateEvent::ToolEnded { source, session_id, name, .. } => {
                 let s = self.session_mut(source, &session_id);
                 s.tools.remove(&name);
                 s.tool_args.remove(&name);
+                s.tool_since.remove(&name);
             }
             StateEvent::TodoSnapshot { source, session_id, todos, .. } => {
                 self.session_mut(source, &session_id).todos = todos;
             }
-            StateEvent::ApprovalRequested { id, session_id, tool, .. } => {
+            StateEvent::ApprovalRequested { id, session_id, tool, source } => {
                 self.approvals.insert(
                     id.clone(),
-                    PendingApproval { session_id, tool, at_ms: self.now_ms },
+                    PendingApproval { session_id, tool, at_ms: self.now_ms, source },
                 );
             }
             StateEvent::ApprovalResolved { id, .. } => {
                 self.approvals.remove(&id);
             }
-            StateEvent::QuestionRequested { id, session_id, text, .. } => {
+            StateEvent::QuestionRequested { id, session_id, text, source } => {
                 self.questions.insert(
                     id,
-                    PendingQuestion { session_id, text, at_ms: self.now_ms },
+                    PendingQuestion { session_id, text, at_ms: self.now_ms, source },
                 );
             }
             StateEvent::QuestionResolved { id, .. } => {
@@ -439,6 +489,10 @@ impl PetState {
                 // (that would keep the pet in attention forever).
                 let prefix = format!("{id}\u{0}");
                 self.questions.retain(|k, _| k != &id && !k.starts_with(&prefix));
+            }
+            StateEvent::PendingSync { source } => {
+                self.approvals.retain(|_, a| a.source != source);
+                self.questions.retain(|_, q| q.source != source);
             }
             StateEvent::UserMessage { source, session_id, text } => {
                 let s = self.session_mut(source, &session_id);
@@ -582,6 +636,9 @@ impl PetState {
                         .map(|t| truncate_chars(&t.content, 120))
                 })
             };
+            if let Some(&earliest) = s.tool_since.values().min() {
+                snap.working_since.insert(id.clone(), earliest);
+            }
             let info = SessionInfo {
                 session_id: id.clone(),
                 source: s.source,
@@ -740,6 +797,40 @@ mod tests {
     }
 
     #[test]
+    fn tool_start_clears_stale_live_text() {
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        // thinking stream accumulated before the tool call
+        p.apply(StateEvent::LiveText {
+            source: Source::Dsh,
+            session_id: "s1".into(),
+            reasoning: Some("思考中…".into()),
+            text: Some("让我先看看…".into()),
+            tool_name: None,
+        });
+        let snap = p.snapshot();
+        assert_eq!(snap.thinking[0].live.text, "让我先看看…");
+        // tool starts -> Working; the stale pre-tool stream must be gone so
+        // the bubble falls back to the ⚙ tool label instead of old think text
+        p.apply(StateEvent::ToolStarted { source: Source::Dsh, session_id: "s1".into(), name: "bash".into(), arguments: None });
+        assert_eq!(p.mode(), Mode::Working);
+        let snap = p.snapshot();
+        assert_eq!(snap.working.len(), 1);
+        assert!(snap.working[0].live.text.is_empty());
+        assert!(snap.working[0].live.reasoning.is_empty());
+        // fresh content streamed after the tool started shows again
+        p.apply(StateEvent::LiveText {
+            source: Source::Dsh,
+            session_id: "s1".into(),
+            reasoning: None,
+            text: Some("新内容".into()),
+            tool_name: None,
+        });
+        let snap = p.snapshot();
+        assert_eq!(snap.working[0].live.text, "新内容");
+    }
+
+    #[test]
     fn failed_window_expires() {
         let mut p = base();
         p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
@@ -880,6 +971,39 @@ mod tests {
     }
 
     #[test]
+    fn pending_sync_clears_only_that_source() {
+        let mut p = base();
+        p.apply(StateEvent::QuestionRequested {
+            source: Source::Dsh,
+            id: "r1\u{0}q1".into(),
+            session_id: "s1".into(),
+            text: "继续?".into(),
+        });
+        p.apply(StateEvent::QuestionRequested {
+            source: Source::Hermes,
+            id: "call_h1".into(),
+            session_id: "h9".into(),
+            text: "确认?".into(),
+        });
+        p.apply(StateEvent::ApprovalRequested {
+            source: Source::Dsh,
+            id: "ap1".into(),
+            session_id: "s1".into(),
+            tool: "bash".into(),
+        });
+        assert_eq!(p.mode(), Mode::Attention);
+        // server restarted: mux reconnect clears DSH pendings; the replay
+        // re-adds whatever is still pending — here nothing DSH-side remains
+        p.apply(StateEvent::PendingSync { source: Source::Dsh });
+        let snap = p.snapshot();
+        assert_eq!(snap.pending_questions.len(), 1); // hermes clarify survives
+        assert_eq!(snap.pending_approvals.len(), 0);
+        assert_eq!(p.mode(), Mode::Attention);
+        p.apply(StateEvent::PendingSync { source: Source::Hermes });
+        assert_eq!(p.mode(), Mode::Idle);
+    }
+
+    #[test]
     fn live_text_accumulates_and_clears_on_turn_end() {
         let mut p = base();
         p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
@@ -978,10 +1102,10 @@ mod tests {
     #[test]
     fn comfyui_run_maps_to_modes() {
         let mut p = base();
-        p.apply(StateEvent::SourceHealth { source: Source::ComfyUi, healthy: true });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: true });
         // poll sets the running prompt + its bubble title (as the connector does)
         p.apply(StateEvent::Poll {
-            source: Source::ComfyUi,
+            source: Source::Script(0),
             items: vec![SessionItem {
                 session_id: "p1".into(),
                 running: true,
@@ -991,23 +1115,23 @@ mod tests {
             ok: true,
             error: None,
         });
-        p.apply(StateEvent::TurnStarted { source: Source::ComfyUi, session_id: "p1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "p1".into(), turn: 1 });
         assert_eq!(p.mode(), Mode::Thinking);
         p.apply(StateEvent::ToolStarted {
-            source: Source::ComfyUi,
+            source: Source::Script(0),
             session_id: "p1".into(),
             name: "KSampler".into(),
             arguments: None,
         });
         assert_eq!(p.mode(), Mode::Working);
         p.apply(StateEvent::ToolEnded {
-            source: Source::ComfyUi,
+            source: Source::Script(0),
             session_id: "p1".into(),
             name: "KSampler".into(),
             error: false,
         });
         p.apply(StateEvent::TurnEnded {
-            source: Source::ComfyUi,
+            source: Source::Script(0),
             session_id: "p1".into(),
             turn: 1,
             reason: TurnEndReason::Completed,
@@ -1016,17 +1140,17 @@ mod tests {
         // snapshot bucket lands the finished prompt in done
         let snap = p.snapshot();
         assert_eq!(snap.done.len(), 1);
-        assert_eq!(snap.done[0].source, Source::ComfyUi);
+        assert_eq!(snap.done[0].source, Source::Script(0));
         assert_eq!(snap.done[0].title, "出图任务 #1");
     }
 
     #[test]
     fn comfyui_failure_and_interrupt() {
         let mut p = base();
-        p.apply(StateEvent::SourceHealth { source: Source::ComfyUi, healthy: true });
-        p.apply(StateEvent::TurnStarted { source: Source::ComfyUi, session_id: "p1".into(), turn: 1 });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: true });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "p1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::ComfyUi,
+            source: Source::Script(0),
             session_id: "p1".into(),
             turn: 1,
             reason: TurnEndReason::Error,
@@ -1034,9 +1158,9 @@ mod tests {
         assert_eq!(p.mode(), Mode::Failed);
         // interrupted is neutral (like aborted): no celebration
         p.now_ms = DEFAULT_FAIL_MS + 1;
-        p.apply(StateEvent::TurnStarted { source: Source::ComfyUi, session_id: "p2".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "p2".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::ComfyUi,
+            source: Source::Script(0),
             session_id: "p2".into(),
             turn: 1,
             reason: TurnEndReason::Interrupted,
@@ -1047,19 +1171,19 @@ mod tests {
     #[test]
     fn queue_depth_aggregates_across_sources() {
         let mut p = base();
-        p.apply(StateEvent::QueueChanged { source: Source::ComfyUi, pending: 3 });
+        p.apply(StateEvent::QueueChanged { source: Source::Script(0), pending: 3 });
         p.apply(StateEvent::QueueChanged { source: Source::Dsh, pending: 2 });
         assert_eq!(p.snapshot().queue_len, 5);
-        p.apply(StateEvent::QueueChanged { source: Source::ComfyUi, pending: 0 });
+        p.apply(StateEvent::QueueChanged { source: Source::Script(0), pending: 0 });
         assert_eq!(p.snapshot().queue_len, 2);
     }
 
     #[test]
     fn comfyui_offline_only_when_everything_down() {
         let mut p = base();
-        p.apply(StateEvent::SourceHealth { source: Source::ComfyUi, healthy: true });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: true });
         assert_eq!(p.mode(), Mode::Idle);
-        p.apply(StateEvent::SourceHealth { source: Source::ComfyUi, healthy: false });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
         p.apply(StateEvent::SourceHealth { source: Source::Dsh, healthy: false });
         p.apply(StateEvent::SourceHealth { source: Source::Hermes, healthy: false });
         assert_eq!(p.mode(), Mode::Offline);

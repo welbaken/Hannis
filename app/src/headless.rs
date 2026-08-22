@@ -2,7 +2,7 @@
 //! prints state transitions. Also `--self-test` validates asset decoding.
 
 use dshpet::config::Config;
-use dshpet::connectors::{comfyui::ComfyUiConnector, dsh::DshConnector, hermes::HermesConnector, stop_flag};
+use dshpet::connectors::{dsh::DshConnector, hermes::HermesConnector, stop_flag};
 use dshpet::state::{Mode, PetState, Snapshot, StateEvent};
 use std::path::Path;
 use std::sync::mpsc::channel;
@@ -21,11 +21,10 @@ pub fn run() {
     }
     let cfg = Config::load(Path::new("config.json"));
     println!(
-        "config: dsh={} hermes_db={:?} comfyui={} ({})",
+        "config: dsh={} hermes_db={:?} scripts={}",
         cfg.dsh_url(),
         cfg.hermes_db_path(),
-        cfg.comfyui.enabled,
-        cfg.comfyui.url
+        cfg.scripts.len()
     );
     drive(&cfg);
 }
@@ -47,13 +46,14 @@ fn debug_run() {
         }
         .spawn(tx.clone(), stop.clone());
     }
-    if cfg.comfyui.enabled {
-        ComfyUiConnector {
-            url: cfg.comfyui.url.clone(),
-            poll_ms: cfg.comfyui.poll_ms,
-            ws: cfg.comfyui.ws,
+    // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
+    for (i, sc) in cfg.scripts.iter().enumerate() {
+        if sc.file.trim().is_empty() {
+            eprintln!("[lua] scripts[{i}] has empty file, skipped");
+            continue;
         }
-        .spawn(tx.clone(), stop.clone());
+        dshpet::connectors::lua::make(i as u16, sc.clone(), None)
+            .spawn(tx.clone(), stop.clone());
     }
     let mut pet = PetState::new(cfg.windows.done_sec * 1000, cfg.windows.fail_sec * 1000);
     pet.set_celebrate_ms(cfg.windows.celebrate_sec * 1000);
@@ -112,13 +112,14 @@ fn drive(cfg: &Config) {
     } else {
         println!("hermes db path unresolvable -> hermes source disabled");
     }
-    if cfg.comfyui.enabled {
-        ComfyUiConnector {
-            url: cfg.comfyui.url.clone(),
-            poll_ms: cfg.comfyui.poll_ms,
-            ws: cfg.comfyui.ws,
+    // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
+    for (i, sc) in cfg.scripts.iter().enumerate() {
+        if sc.file.trim().is_empty() {
+            eprintln!("[lua] scripts[{i}] has empty file, skipped");
+            continue;
         }
-        .spawn(tx.clone(), stop.clone());
+        dshpet::connectors::lua::make(i as u16, sc.clone(), None)
+            .spawn(tx.clone(), stop.clone());
     }
 
     let mut pet = PetState::new(cfg.windows.done_sec * 1000, cfg.windows.fail_sec * 1000);
@@ -149,12 +150,17 @@ fn drive(cfg: &Config) {
 }
 
 fn print_snapshot(s: &Snapshot) {
+    let scripts = s
+        .sources
+        .iter()
+        .filter(|(src, _)| matches!(src, dshpet::state::Source::Script(_)))
+        .count();
     println!(
-        "=== MODE {:?} (sources: dsh={} hermes={} comfyui={}) ===",
+        "=== MODE {:?} (sources: dsh={} hermes={} scripts={}) ===",
         s.mode,
         s.sources.get(&dshpet::state::Source::Dsh).copied().unwrap_or(false),
         s.sources.get(&dshpet::state::Source::Hermes).copied().unwrap_or(false),
-        s.sources.get(&dshpet::state::Source::ComfyUi).copied().unwrap_or(false),
+        scripts,
     );
     if s.queue_len > 0 {
         println!("  queue: {} pending", s.queue_len);
@@ -201,8 +207,8 @@ fn self_test() {
     let dir = Path::new("resource");
     let mut ok = true;
     for name in ["idle", "working", "think", "attention", "done", "fail", "move"] {
-        // auto: prefers <name>.sheet.*, then legacy split, then <name>.webp
-        match dshpet::anim::load_animation(&dir, name, 0.5, "auto") {
+        // sheets are the only asset format now (resource/<name>.sheet.*)
+        match dshpet::anim::load_animation(&dir, name, 0.5, 42) {
             Ok(a) => {
                 println!(
                     "  {name}: {} frames, {}ms, tail_start@{}",

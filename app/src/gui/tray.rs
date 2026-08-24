@@ -15,6 +15,10 @@ pub const MENU_QUIT: usize = 1001;
 pub const MENU_AVOID_TOGGLE: usize = 1002;
 /// Toggle 自动收起 (auto-hide): idle/offline 太久就把宠物收到任务栏后。
 pub const MENU_AUTOHIDE_TOGGLE: usize = 1003;
+/// 打开"接入口设置"窗口(启停 / 参数如 log 位置、IP 及端口)。
+pub const MENU_ENDPOINTS: usize = 1004;
+/// 接入口子菜单里第 i 个脚本的启停项 id = MENU_SCRIPT_BASE + i。
+pub const MENU_SCRIPT_BASE: usize = 1100;
 
 pub struct Tray {
     hwnd: HWND,
@@ -109,7 +113,13 @@ impl Tray {
         /// Show the right-click menu at the cursor; returns the chosen id.
     /// `avoid_enabled` / `auto_hide_enabled` control the checkmarks so the
     /// current states are visible before the user picks anything.
-    pub fn show_menu(&self, avoid_enabled: bool, auto_hide_enabled: bool) -> Option<usize> {
+    /// `scripts`: (启用?, 显示名) 列表,渲染"接入口"子菜单的启停项。
+    pub fn show_menu(
+        &self,
+        avoid_enabled: bool,
+        auto_hide_enabled: bool,
+        scripts: &[(bool, String)],
+    ) -> Option<usize> {
         unsafe {
             let menu = CreatePopupMenu().unwrap_or(HMENU::default());
             if menu.is_invalid() {
@@ -121,7 +131,19 @@ impl Tray {
             let hide_flags: MENU_ITEM_FLAGS =
                 if auto_hide_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, hide_flags, MENU_AUTOHIDE_TOGGLE, w!("自动收起"));
+            // 接入口子菜单:每脚本一个勾选项(点击=启停切换)
+            if !scripts.is_empty() {
+                let sub = CreatePopupMenu().unwrap_or(HMENU::default());
+                for (i, (on, label)) in scripts.iter().enumerate() {
+                    let flags: MENU_ITEM_FLAGS =
+                        if *on { MF_STRING | MF_CHECKED } else { MF_STRING };
+                    let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                    let _ = AppendMenuW(sub, flags, (MENU_SCRIPT_BASE + i) as usize, PCWSTR(wide.as_ptr()));
+                }
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("接入口"));
+            }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, MENU_ENDPOINTS, w!("接入口设置…"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出"));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);

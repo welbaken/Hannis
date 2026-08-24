@@ -74,8 +74,15 @@ pub struct Compositor {
     /// 亚克力截屏得到的是"桌面 + 宠物自己上一帧"的混合画面,逐像素
     /// 反混合即可还原桌面原色——否则反馈循环会在几帧内把亚克力洗成
     /// 一片均匀平色(看起来就是普通半透明,而非模糊玻璃)。
+    /// 仅在亚克力启用时保留(省 ~3MB 常驻;阴影不需要它)。
     last_frame: Option<Vec<u8>>,
     last_pos: (i32, i32),
+    /// 亚克力启用时才在 present() 里保存 last_frame(诊断/省内存)。
+    pub keep_last_frame: bool,
+    /// 窗口最后一次移动的时刻;300ms 内动过 = 移动中(拖拽/滑动/避让)。
+    /// 移动中亚克力停用(截屏会采到移动路径上的桌面杂色,如绿色窗口),
+    /// 回退普通半透明填充,停稳后自动恢复。
+    moved_at: Option<std::time::Instant>,
 }
 
 fn premul(bg: u8, a: u8) -> u8 {
@@ -282,6 +289,8 @@ impl Compositor {
             acrylic_last: None,
             last_frame: None,
             last_pos: (0, 0),
+            keep_last_frame: false,
+            moved_at: None,
         }
     }
 
@@ -363,11 +372,9 @@ impl Compositor {
                 continue; // 收起状态:被任务栏盖住的部分留透明
             }
             let mut src_off = (row as usize) * fw as usize + bx as usize;
-            // NOTE: bx must be scaled by 4 bytes/pixel — a raw `+ bx` here
-            // shifts the whole draw left by (bx - bx/4) px per frame (each
-            // frame's bbox differs, so the pet visibly jitters/drifts as the
-            // animation plays).
-            let mut dst_idx = ((dst_row as u32) * self.win_w * 4 + (bx.max(0) as u32) * 4) as usize;
+            // NOTE: 字节索引必须含 (x + bx)*4 —— 只写 bx*4 会丢掉绘制坐标 x,
+            // 本体永远贴着窗口左缘(横向偏移不生效),与阴影/气泡位置脱节。
+            let mut dst_idx = (((dst_row as u32) * self.win_w + (x + bx).max(0) as u32) * 4) as usize;
             for col in bx..bx + bw {
                 let dst_col = x + col;
                 if dst_col >= 0 && dst_col < self.win_w as i32 {
@@ -556,6 +563,116 @@ impl Compositor {
                     continue;
                 }
                 let sa = (cv * a + 127) / 255; // shadow alpha at this pixel
+                let di = (drow * win_w + col as usize) * 4;
+                let inv = 255 - sa;
+                let d = &mut bits[di..di + 4];
+                d[0] = ((d[0] as u32 * inv + 127) / 255) as u8;
+                d[1] = ((d[1] as u32 * inv + 127) / 255) as u8;
+                d[2] = ((d[2] as u32 * inv + 127) / 255) as u8;
+                d[3] = (sa + (d[3] as u32 * inv + 127) / 255).min(255) as u8;
+            }
+        }
+    }
+
+    /// 宠物本体的方向光投影(演示方案 3):取帧的 alpha 剪影 → 双趟盒式
+    /// 模糊(≈高斯)→ 黑色按 `alpha` 合成到本体之下、偏移 (dx, dy) 处。
+    /// 与 [`Compositor::soft_shadow`] 同一套机制,只是形状来自帧的逐像素
+    /// 覆盖度而非圆角矩形。`fade`(0..1)让投影随本体一起淡入淡出;
+    /// 自动收起时与身体一致按 clip_bottom 裁剪。
+    pub fn draw_frame_shadow(
+        &mut self,
+        f: &Frame,
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        blur: u32,
+        alpha: u8,
+        fade: f32,
+    ) {
+        // 一次性几何日志(诊断"横向偏移过大"用;跑一次后把 hannis.log
+        // 里 [shadow] 行发回即可删掉)
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(dir) = exe.parent() {
+                        if let Ok(mut fh) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(dir.join("hannis.log"))
+                        {
+                            use std::io::Write;
+                            let _ = writeln!(
+                                fh,
+                                "[shadow] frame {}x{} at window ({x},{y}) dx={dx} dy={dy} blur={blur} alpha={alpha} win={}x{} screen_pos=({},{})",
+                                f.w, f.h, self.win_w, self.win_h, self.screen_pos.0, self.screen_pos.1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if f.w == 0 || f.h == 0 || alpha == 0 || fade <= 0.0 {
+            return;
+        }
+        let a = ((alpha as f32 * fade.clamp(0.0, 1.0)) as u32).min(255);
+        if a == 0 {
+            return;
+        }
+        let blur = blur.max(1) as i64;
+        let pad = (blur + dx.max(0) as i64 + dy.max(0) as i64) as usize;
+        let bw = f.w as usize + pad * 2;
+        let bh = f.h as usize + pad * 2;
+        self.shadow_cov.resize(bw * bh, 0);
+        self.shadow_cov.fill(0); // 上一尺寸的残影可能残留在 halo 区
+        self.shadow_tmp.resize(bw * bh, 0);
+        // 把帧的覆盖度铺进 padded 缓冲(整体偏移 dx, dy)
+        let off_x = pad as i64 + dx as i64;
+        let off_y = pad as i64 + dy as i64;
+        let fw = f.w as usize;
+        for row in 0..f.h as usize {
+            let dbase = (row as i64 + off_y) as usize * bw + off_x as usize;
+            let sbase = row * fw;
+            #[allow(clippy::needless_range_loop)]
+            for col in 0..fw {
+                self.shadow_cov[dbase + col] = f.pixel_alpha(sbase + col);
+            }
+        }
+        // 两趟盒式模糊 ≈ 高斯衰减
+        let br = (blur / 2).max(1) as usize;
+        {
+            let (cov, tmp) = (&mut self.shadow_cov, &mut self.shadow_tmp);
+            for _ in 0..2 {
+                box_blur_h(cov, bw, bh, br, tmp);
+                box_blur_v(tmp, bw, bh, br, cov);
+            }
+        }
+        // 合成:黑色 at cov*a(预乘黑 = 仅 alpha),随 clip_bottom 裁剪
+        let cov_ptr = self.shadow_cov.as_ptr();
+        let ox = x - pad as i32;
+        let oy = y - pad as i32;
+        let clip = self.clip_bottom.max(0) as i32;
+        let x0 = ox.max(0);
+        let y0 = oy.max(0);
+        let x1 = (ox + bw as i32).min(self.win_w as i32);
+        let y1 = (oy + bh as i32).min(self.win_h as i32 - clip);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let win_w = self.win_w as usize;
+        let bits = self.bits_mut();
+        for row in y0..y1 {
+            let brow = (row - oy) as usize;
+            let drow = row as usize;
+            for col in x0..x1 {
+                let bcol = (col - ox) as usize;
+                let cv = unsafe { *cov_ptr.add(brow * bw + bcol) } as u32;
+                if cv == 0 {
+                    continue;
+                }
+                let sa = (cv * a + 127) / 255;
                 let di = (drow * win_w + col as usize) * 4;
                 let inv = 255 - sa;
                 let d = &mut bits[di..di + 4];
@@ -862,6 +979,11 @@ impl Compositor {
         if w == 0 || h == 0 {
             return false;
         }
+        // 移动中:停用亚克力(回退普通填充),避免截到移动路径上的杂色
+        // 并省下截屏+模糊开销,保持拖动流畅
+        if self.is_moving() {
+            return false;
+        }
         let now = std::time::Instant::now();
         let refresh = self
             .acrylic_last
@@ -1035,7 +1157,18 @@ impl Compositor {
 
     /// 设置窗口屏幕原点(compose 时更新;亚克力截屏坐标用)。
     pub fn set_screen_pos(&mut self, x: i32, y: i32) {
+        if (x, y) != self.screen_pos {
+            self.moved_at = Some(std::time::Instant::now());
+        }
         self.screen_pos = (x, y);
+    }
+
+    /// 窗口 300ms 内移动过(拖拽/自动收起滑动/避让):移动中亚克力
+    /// 截屏会采到移动路径上的杂色,且每帧截屏+模糊拉低刷新率。
+    pub fn is_moving(&self) -> bool {
+        self.moved_at
+            .map(|t| t.elapsed() < std::time::Duration::from_millis(300))
+            .unwrap_or(false)
     }
 
     /// Measure the pixel width of one line (1× font; for pills/tags).
@@ -1103,11 +1236,16 @@ impl Compositor {
                 ULW_ALPHA,
             );
         }
-        // 记住"屏幕上正在显示的帧"与它的位置(亚克力反混合用)
-        self.last_frame = Some(unsafe {
-            std::slice::from_raw_parts(self.bits_ptr, self.bits_len).to_vec()
-        });
-        self.last_pos = self.screen_pos;
+        // 记住"屏幕上正在显示的帧"与它的位置(亚克力反混合用;仅需时,
+        // 移动中跳过——反正亚克力也停用了,省 3MB 克隆)
+        if self.keep_last_frame && !self.is_moving() {
+            self.last_frame = Some(unsafe {
+                std::slice::from_raw_parts(self.bits_ptr, self.bits_len).to_vec()
+            });
+            self.last_pos = self.screen_pos;
+        } else {
+            self.last_frame = None;
+        }
     }
 }
 

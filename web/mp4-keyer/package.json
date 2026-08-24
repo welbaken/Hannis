@@ -1,0 +1,15 @@
+{
+  "name": "mp4-keyer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "dshpet 绿幕 mp4 -> sprite sheet 本地网页工具(上传/预览/下载)",
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "sharp": "^0.35.3"
+  }
+}

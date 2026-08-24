@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>绿幕 mp4 → Sprite Sheet</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>绿幕 mp4 → Sprite Sheet</h1>
+  <p class="sub">上传绿幕视频,自动去绿幕 + 调色板量化,生成与 dshpet <code>resource/</code> 同格式的 <code>.sheet.png</code> / <code>.sheet.json</code>,在线预览并下载。</p>
+</header>
+
+<main>
+  <section class="col">
+    <div class="card" id="uploadCard">
+      <h2>1 · 选择视频</h2>
+      <div id="dropzone" tabindex="0">
+        <p id="dzText">点击选择或拖入 <b>mp4</b> 文件</p>
+        <p id="fileInfo" class="dim"></p>
+        <input type="file" id="fileInput" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm,.m4v" hidden>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>2 · 处理参数</h2>
+      <div class="grid">
+        <label>输出名称
+          <input type="text" id="optName" placeholder="lucky">
+        </label>
+        <label>调色板颜色数
+          <input type="number" id="optPalette" min="2" max="256" step="1" value="256">
+        </label>
+        <label>键色(自动 / 手动 r,g,b)
+          <div class="row">
+            <select id="optKeyMode">
+              <option value="auto" selected>自动(边框取色)</option>
+              <option value="manual">手动</option>
+            </select>
+            <input type="text" id="optKey" placeholder="2,246,0" disabled>
+          </div>
+        </label>
+        <label>完全透明阈值 dLow
+          <input type="number" id="optDlow" min="1" max="255" step="1" value="32">
+        </label>
+        <label>完全不透明阈值 dHigh
+          <input type="number" id="optDhigh" min="1" max="512" step="1" value="80">
+        </label>
+        <label>去绿边
+          <select id="optDespill">
+            <option value="1" selected>开(削减半透明处绿色)</option>
+            <option value="0">关</option>
+          </select>
+        </label>
+      </div>
+      <p class="dim tips">dLow/dHigh 为像素颜色到键色的距离阈值:距离 &le; dLow 判为背景, &ge; dHigh 判为人物,中间平滑过渡。</p>
+    </div>
+
+    <div class="card">
+      <button id="startBtn" disabled>开始处理</button>
+      <div class="progress">
+        <div class="bar"><div id="barFill"></div></div>
+        <span id="stageText">等待上传</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="col">
+    <div class="card" id="resultCard" hidden>
+      <h2>3 · 预览与下载</h2>
+      <div id="animBox">
+        <canvas id="anim" width="480" height="480"></canvas>
+        <div class="animctl">
+          <button id="playBtn" title="播放/暂停">⏸</button>
+          <input type="range" id="frameSlider" min="0" max="0" value="0" step="1">
+          <span id="frameText" class="dim">0/0</span>
+        </div>
+      </div>
+      <div class="statline dim" id="stats"></div>
+      <p class="dim">完整网格图(点开新标签查看原尺寸):</p>
+      <a id="sheetThumbLink" href="#" target="_blank" rel="noopener">
+        <img id="sheetThumb" alt="sprite sheet 网格图">
+      </a>
+      <details>
+        <summary>QA 预览条(棋盘格底,取样帧)</summary>
+        <img id="previewStrip" alt="QA 预览条" style="max-width:100%">
+      </details>
+      <div class="downloads">
+        <a id="dlPng" class="btn" download>⬇ 下载 <code>.sheet.png</code></a>
+        <a id="dlJson" class="btn" download>⬇ 下载 <code>.sheet.json</code></a>
+        <a id="dlPreview" class="btn" download hidden>⬇ 预览条</a>
+      </div>
+      <p class="dim">下载后放入 <code>resource/</code> 目录并把文件名改为状态名(如 <code>lucky.sheet.png</code>)即可被运行期加载。</p>
+    </div>
+  </section>
+</main>
+
+<footer class="dim">
+  由 tools/keyer.js 提供的管线服务:ffmpeg 解码 → 色度距离去绿幕(+smoothstep 过渡 + 去绿边) → 网格打包 → 调色板量化(PNG tRNS)。
+</footer>
+
+<script src="/client.js"></script>
+</body>
+</html>

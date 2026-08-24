@@ -19,6 +19,9 @@
 
 local cfg = pet.config() or {}
 local args = cfg.args or {}
+-- 接入口设置界面参数声明(键 | 标签 | 默认值):
+--[hannis:set] url | ComfyUI 地址(IP及端口) | http://127.0.0.1:8188
+--[hannis:set] timeout_ms | 请求超时(ms) | 5000
 local base = (args.url or "http://127.0.0.1:8188"):gsub("/+$", "")
 local timeout_ms = args.timeout_ms or 5000
 local poll = cfg.poll_ms or 2000

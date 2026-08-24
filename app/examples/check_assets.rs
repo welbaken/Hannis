@@ -10,7 +10,7 @@ use std::time::Instant;
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: check_assets <dir>");
     let dir = Path::new(&dir);
-    let states = ["idle", "working", "think", "attention", "done", "fail", "move"];
+    let states = ["idle", "working", "think", "attention", "done", "fail", "move", "lucky"];
     let mut any_fail = false;
     for state in states {
         let t0 = Instant::now();
@@ -25,17 +25,18 @@ fn main() {
                 let dims: BTreeSet<(u32, u32)> = a.frames.iter().map(|f| (f.w, f.h)).collect();
                 let mem = a.frames.iter().map(|f| f.rgba.len()).sum::<usize>();
                 let mem_mb = mem as f64 / 1048576.0;
-                let alpha0 = f0.rgba.iter().step_by(4).filter(|&&a| a == 0).count();
-                let opaque = f0.rgba.iter().step_by(4).filter(|&&a| a == 255).count();
-                let n = f0.rgba.len() / 4;
-                let corner = [&f0.rgba[..4], &f0.rgba[(f0.w as usize - 1) * 4..f0.w as usize * 4]].concat();
+                // 调色板(compact)帧没有直接 rgba,统一走 pixel_alpha 统计
+                let n = (f0.w as usize) * (f0.h as usize);
+                let alpha0 = (0..n).filter(|&i| f0.pixel_alpha(i) == 0).count();
+                let opaque = (0..n).filter(|&i| f0.pixel_alpha(i) == 255).count();
+                let corner = [f0.pixel_alpha(0), f0.pixel_alpha(f0.w as usize - 1)];
                 println!(
                     "{state:12} OK  frames={:3} frame0={}x{} dims_set={dims:?} total_ms={:5} mem={:.0}MB decode={:.2}s",
                     a.frame_count(), f0.w, f0.h, a.total_ms(), mem_mb, t0.elapsed().as_secs_f64()
                 );
                 println!(
-                    "{state:12}     alpha: fully_transparent={} opaque={} of {n} px  first_frame_corners=[{:?},{:?}]",
-                    alpha0, opaque, &corner[..4], &corner[4..8]
+                    "{state:12}     alpha: fully_transparent={} opaque={} of {n} px  frame0_corner_alpha={corner:?}",
+                    alpha0, opaque
                 );
                 println!(
                     "{state:12}     durations: uniform {} ms (frame_ms)",

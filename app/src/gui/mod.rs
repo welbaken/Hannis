@@ -15,7 +15,11 @@ use dshpet::connectors::dsh::DshConnector;
 use dshpet::connectors::hermes::HermesConnector;
 use dshpet::connectors::stop_flag;
 use dshpet::state::{Mode, PetState, Snapshot, StateEvent};
+pub mod settings;
+use dshpet::config::ScriptEntryConfig;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -37,8 +41,60 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// to make crashes reproducible.
 static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
-pub(crate) fn log_line(msg: &str) {
-    if let Ok(mut g) = LOG.lock() {
+/// 进程内存采样(诊断用):工作集 / 私有字节,单位 MB。
+/// 非 Windows(头less 调试)下返回 0。
+fn proc_ws_mb() -> u64 {
+    get_proc_mem().map(|m| m.0 / (1024 * 1024)).unwrap_or(0)
+}
+fn proc_priv_mb() -> u64 {
+    get_proc_mem().map(|m| m.1 / (1024 * 1024)).unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn get_proc_mem() -> Option<(u64, u64)> {
+    use windows::Win32::System::ProcessStatus::K32GetProcessMemoryInfo;
+    unsafe {
+        let mut pmc = windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS::default();
+        let cb = std::mem::size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS>() as u32;
+        let h = windows::Win32::System::Threading::GetCurrentProcess();
+        if K32GetProcessMemoryInfo(h, &mut pmc, cb).as_bool() {
+            Some((pmc.WorkingSetSize as u64, pmc.PagefileUsage as u64))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_proc_mem() -> Option<(u64, u64)> {
+    None
+}
+
+/// 每脚本的停止令牌(接入口启停:置 true 让该脚本线程在下一次
+/// 可中断等待处退出)。托盘切换/设置窗口保存时重建。
+static SCRIPT_STOPS: OnceLock<Mutex<HashMap<u16, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn script_stops() -> &'static Mutex<HashMap<u16, Arc<AtomicBool>>> {
+    SCRIPT_STOPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 启动一个 Lua 接入口线程(独立 stop 令牌,便于单独启停)。
+fn spawn_script(i: usize, sc: &ScriptEntryConfig, tx: &Sender<StateEvent>, exe_dir: &std::path::Path) {
+    if sc.file.trim().is_empty() {
+        log_line(&format!("[lua] scripts[{i}] has empty file, skipped"));
+        return;
+    }
+    let mut sc = sc.clone();
+    // 相对路径按 exe 目录解析(不能依赖进程 CWD:快捷方式启动时
+    // CWD 常是 System32,之前会静默加载失败 → 该源无反应)
+    sc.file = Config::resolve_script_path(exe_dir, &sc.file).display().to_string();
+    let tok = stop_flag();
+    script_stops().lock().unwrap().insert(i as u16, tok.clone());
+    log_line(&format!("[lua] scripts[{i}] spawn '{}' -> {}", sc.name, sc.file));
+    dshpet::connectors::lua::make(i as u16, sc, Some(exe_dir.join("hannis.log"))).spawn(tx.clone(), tok);
+}
+
+pub(crate) fn log_line(msg: &str) {    if let Ok(mut g) = LOG.lock() {
         if let Some(f) = g.as_mut() {
             use std::io::Write;
             let _ = writeln!(f, "{} {msg}", now_ms());
@@ -120,6 +176,8 @@ pub struct App {
     pub cf_from: Option<Frame>,
     pub cf_t: f32,
     pub last_tick: Instant,
+    /// 内存日志采样时刻(每 30s 写一行 [mem])。
+    pub last_mem_log: Instant,
     /// True when a fullscreen app on the same monitor is covering the pet;
     /// the window is hidden via ShowWindow and not interacted with until the
     /// fullscreen app exits.
@@ -241,17 +299,11 @@ pub fn run() {
     }
     // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
     for (i, sc) in cfg.scripts.iter().enumerate() {
-        if sc.file.trim().is_empty() {
-            eprintln!("[lua] scripts[{i}] has empty file, skipped");
+        if !sc.enabled {
+            log_line(&format!("[lua] scripts[{i}] disabled in config, skipped"));
             continue;
         }
-        let mut sc = sc.clone();
-        // 相对路径按 exe 目录解析(不能依赖进程 CWD:快捷方式启动时
-        // CWD 常是 System32,之前会静默加载失败 → 该源无反应)
-        sc.file = Config::resolve_script_path(&exe_dir, &sc.file).display().to_string();
-        log_line(&format!("[lua] scripts[{i}] file -> {}", sc.file));
-        dshpet::connectors::lua::make(i as u16, sc, Some(exe_dir.join("hannis.log")))
-            .spawn(tx.clone(), stop.clone());
+        spawn_script(i, sc, &tx, &exe_dir);
     }
 
     let done_ms = cfg.windows.done_sec * 1000;
@@ -281,6 +333,7 @@ pub fn run() {
     }
 
     let bubble_theme = dshpet::config::BubbleTheme::resolve(&cfg.bubble.theme);
+    let acrylic_on = cfg.bubble.theme.acrylic; // cfg 之后被移入 App,先取出来
     let mut app = Box::new(App {
         cfg,
         resource_dir,
@@ -315,6 +368,7 @@ pub fn run() {
         last_tick: Instant::now(),
         hidden: false,
         last_fs_check: Instant::now(),
+        last_mem_log: Instant::now(),
         avoid_home: None,
         avoid_offscreen: false,
         avoid_box: None,
@@ -336,6 +390,8 @@ pub fn run() {
     let hwnd = window::create_main_window(ptr, w, h, icon.unwrap_or(HICON::default()));
     app.hwnd = hwnd;
     app.comp = render::Compositor::new(hwnd, font_scale);
+    // 上一帧快照只在亚克力需要反混合时保留(省 ~3MB 常驻)
+    app.comp.keep_last_frame = acrylic_on;
     window::set_window_rect(hwnd, x, y, w, h);
     window::show(hwnd);
     // 注意:不再对整窗调用 DWM accent(SetWindowCompositionAttribute):
@@ -450,6 +506,11 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_millis() as u64;
         self.last_tick = now;
+        // 内存采样(每 30s 一行,诊断"内存多了很多"用):工作集/私有字节
+        if now.duration_since(self.last_mem_log) >= Duration::from_secs(30) {
+            self.last_mem_log = now;
+            log_line(&format!("[mem] ws={}MB priv={}MB", proc_ws_mb(), proc_priv_mb()));
+        }
         // drive the pending-request TTL reaper (approvals/questions older
         // than TTL_APPROVAL_MS get dropped); without this the 30-min safety
         // net never runs and a stale pending keeps attention forever
@@ -1087,11 +1148,22 @@ impl App {
             let (_, y, _, h) = self.window_size();
             let wb = self.work_area_bottom();
             self.collapse_clip = (h - (wb - y)).clamp(0, h);
-            // 悬停检测:点击穿透后收不到鼠标消息,用光标位置轮询
+            // 悬停检测:点击穿透后收不到鼠标消息,用光标位置轮询。
+            // 只认"可见部分":裁剪线以上 ∩ 本体可见框——被任务栏挡住
+            // 的身体区域不应触发唤回(否则划过任务栏就把宠物拽出来)。
             let (cx, cy) = window::cursor_pos();
             let (wx, wy, ww, wh) = self.window_size();
-            let over = cx >= wx && cx < wx + ww && cy >= wy && cy < wy + wh;
-            if over {
+            let vis_bottom = wy + (wh - self.collapse_clip).max(0); // 裁剪线的屏幕 y
+            let (hx0, hy0, hx1, hy1) = match self.avoid_box {
+                // 本体可见框(window-local)∩ 裁剪可见区
+                Some((bx, by, bw, bh)) => {
+                    let top = wy + by;
+                    let bottom = (wy + by + bh).min(vis_bottom);
+                    (wx + bx, top, wx + bx + bw, bottom.max(top))
+                }
+                None => (wx, wy, wx + ww, vis_bottom),
+            };
+            let over = cx >= hx0 && cx < hx1 && cy >= hy0 && cy < hy1;            if over {
                 self.collapse_hover_since.get_or_insert(now_ms());
             } else {
                 self.collapse_hover_since = None;
@@ -1123,9 +1195,12 @@ impl App {
         self.collapse_idle_since = None;
         // 目标:任务栏区域。保持置顶(头部悬浮在所有窗口之上),身体部分
         // 到达后通过 draw 裁剪(见 collapse_clip)留透明;先滑动后穿透。
-        let sh = screen_size().1;
+        // 锚点用窗口所在显示器的工作区底(=任务栏顶),而非主屏高度——
+        // 多屏不同分辨率/DPI 时不会错位;任务栏高度变化由 update_collapse
+        // 里每帧重查的 work_area_bottom 兜底。
         let yf = self.cfg.auto_hide.y_factor.clamp(0.05, 1.0);
-        let ty = (sh as f32 - yf * h as f32).round() as i32;
+        let wb = self.work_area_bottom();
+        let ty = (wb as f32 - yf * h as f32).round() as i32;
         self.collapse_anim = Some((x, ty));
         // 收起期间不参与回避模式(位置/穿透冲突)
         self.avoid_offscreen = false;
@@ -1170,14 +1245,14 @@ impl App {
 
     /// Re-scan the loaded animation's first frame for the bbox of non-
     /// transparent pixels and cache it in `avoid_box` (window-local coords; the
-    /// sprite is drawn at (WINDOW_EXTRA_W, 0) in `compose`). One frame scan per
+    /// sprite is drawn at (0, 0) in `compose`). One frame scan per
     /// animation load — ~sub-ms for an 800px canvas, and nothing per tick.
     /// Called whenever `self.anim` changes.
     fn refresh_avoid_box(&mut self) {
         self.avoid_box = self.anim.as_ref().and_then(|a| {
             a.frame(0)
                 .alpha_bbox()
-                .map(|(bx, by, bw, bh)| (bx + WINDOW_EXTRA_W as i32, by, bw, bh))
+                .map(|(bx, by, bw, bh)| (bx, by, bw, bh))
         });
     }
 
@@ -1245,7 +1320,8 @@ impl App {
         }
 
         self.comp.clear();
-        let pet_x = WINDOW_EXTRA_W as i32;
+        // 本体锚定在窗口左缘(用户确认的位置);窗口右侧保留 EXTRA 留白。
+        let pet_x = 0i32;
         let pet_y = 0i32;
         let alpha = self.fade_alpha * self.cfg.opacity_for(&self.mode);
 
@@ -1258,6 +1334,17 @@ impl App {
                 + ((1.0 - self.bubble_fade) * 8.0) as i32; // 从宠物方向滑入
             let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
             self.bubble.draw(&mut self.comp, bx, by, self.mode, self.bubble_fade);
+        }
+
+        // 本体方向光投影(演示方案 3):偏移 (3,3)px、模糊 12px、α 40%
+        // (按 DPI 缩放);层序:气泡 → 投影 → 本体,随本体一起淡入淡出。
+        if let Some(a) = &self.anim {
+            let idx = self.player.as_ref().map(|p| p.idx).unwrap_or(0);
+            let s = self.comp.dpi_scale();
+            let sdx = (3.0 * s).round() as i32;
+            let sdy = (3.0 * s).round() as i32;
+            let blur = ((12.0 * s).round() as u32).max(3);
+            self.comp.draw_frame_shadow(a.frame(idx), pet_x, pet_y, sdx, sdy, blur, 102, alpha);
         }
 
         if self.mode == Mode::Offline {
@@ -1393,16 +1480,47 @@ impl App {
 
     pub fn show_tray_menu(&mut self) {
         if let Some(t) = &self.tray {
-            if let Some(cmd) = t.show_menu(self.cfg.avoid.enabled, self.cfg.auto_hide.enabled) {
+            let scripts = self.script_menu_entries();
+            if let Some(cmd) = t.show_menu(self.cfg.avoid.enabled, self.cfg.auto_hide.enabled, &scripts) {
                 match cmd {
                     tray::MENU_QUIT => unsafe {
                         PostQuitMessage(0);
                     },
                     tray::MENU_AVOID_TOGGLE => self.toggle_avoid(),
                     tray::MENU_AUTOHIDE_TOGGLE => self.toggle_auto_hide(),
+                    tray::MENU_ENDPOINTS => settings::open_settings(self),
+                    c if c >= tray::MENU_SCRIPT_BASE => self.toggle_script(c - tray::MENU_SCRIPT_BASE),
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// 托盘"接入口"子菜单项:(启用?, 显示名)。
+    fn script_menu_entries(&self) -> Vec<(bool, String)> {
+        self.cfg
+            .scripts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let label = if s.name.is_empty() { format!("脚本 {}", i + 1) } else { s.name.clone() };
+                (s.enabled, label)
+            })
+            .collect()
+    }
+
+    /// 切换接入口启停:写回 config.json,停旧线程,启用时立即重启。
+    fn toggle_script(&mut self, i: usize) {
+        let Some(sc) = self.cfg.scripts.get(i).cloned() else { return };
+        let on = !sc.enabled;
+        self.cfg.scripts[i].enabled = on;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        if on {
+            spawn_script(i, &sc, &self.tx, &self.exe_dir());
+            log_line(&format!("[lua] scripts[{i}] enabled -> respawned"));
+        } else if let Some(t) = script_stops().lock().unwrap().get(&(i as u16)) {
+            t.store(true, Ordering::Relaxed);
+            log_line(&format!("[lua] scripts[{i}] disabled"));
         }
     }
 

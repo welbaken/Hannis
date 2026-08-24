@@ -18,6 +18,10 @@
 
 local cfg = pet.config() or {}
 local args = cfg.args or {}
+-- 接入口设置界面参数声明(键 | 标签 | 默认值):
+--[hannis:set] log | MAA 日志路径 | D:\MeoAssistantArknights\debug\gui.log
+--[hannis:set] attention_ms | attention 判定阈值(ms) | 3000
+--[hannis:set] stream | 信息流开关(true/false) | true
 local path = args.log or "D:\\MeoAssistantArknights\\debug\\gui.log"
 local poll = cfg.poll_ms or 1000
 local attention_ms = args.attention_ms or 3000
@@ -92,6 +96,8 @@ local pending_q = nil
 local pending_at = 0
 local q_seq = 0
 local last_line = nil
+-- 消息流分隔标记:消息之间补 "\n"(GUI 端 text 累积);新链复位
+local need_nl = false
 
 local function resolve_q()
   if pending_q then
@@ -108,6 +114,7 @@ local function start_chain(label)
   last_task = nil
   run_ended = false
   pending_q = nil
+  need_nl = false -- 新链:消息流从头开始,第一条前不加换行
   pet.session_started(session_id, turn)
 end
 
@@ -218,7 +225,9 @@ end
 local stream_buf = nil
 local function flush_stream()
   if stream_buf and session_id then
-    pet.live_text(session_id, { text = stream_buf })
+    local sep = need_nl and "\n" or ""
+    pet.live_text(session_id, { text = sep .. stream_buf })
+    need_nl = true
   end
   stream_buf = nil
 end

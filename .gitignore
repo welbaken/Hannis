@@ -17,3 +17,5 @@ dist/
 # runtime logs / scratch media
 maa.log
 mp4/
+# web tool runtime data (results expire)
+web/mp4-keyer/data/

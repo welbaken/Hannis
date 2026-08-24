@@ -463,6 +463,8 @@ pub struct ScriptEntryConfig {
     /// true = remove os/io/package/require/dofile/loadfile/load/debug from the
     /// script's globals (filesystem/process access is disabled).
     pub sandbox: bool,
+    /// false = 不启动该接入口(托盘"接入口"子菜单可切换,写回 config.json)。
+    pub enabled: bool,
 }
 
 impl Default for ScriptEntryConfig {
@@ -473,6 +475,7 @@ impl Default for ScriptEntryConfig {
             poll_ms: 1000,
             args: None,
             sandbox: false,
+            enabled: true,
         }
     }
 }

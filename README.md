@@ -250,6 +250,8 @@ sheet 由源 webp 生成:
 ```bash
 node tools/make_sheets.js            # 需要 sharp;全部 *.webp 打包为 sheet
 python tools/split_webp.py           # 等价工具(Pillow);生成 resource/<state>.sheet.*
+node tools/mp4_to_sheet.js --name lucky   # 绿幕 mp4 直接产出 sheet(去绿幕+量化,核心在 tools/keyer.js)
+node web/mp4-keyer/server.js         # 网页版:上传 mp4 -> 预览/下载(默认 http://127.0.0.1:3137)
 ```
 
 sheet.json 只含几何字段(`width`/`height`/`frame_count`/`frames_per_row`);每帧时长统一由
@@ -260,6 +262,8 @@ sheet.json 只含几何字段(`width`/`height`/`frame_count`/`frames_per_row`);�
 ```
 app/            Rust 源码(lib 纯逻辑可测 + gui Windows 部分;可执行名 hannis)
 tools/          make_sheets.js / split_webp.py 素材打包工具(webp -> sprite sheet)
+                mp4_to_sheet.js + keyer.js 绿幕 mp4 -> sprite sheet(CLI,与网页共用管线)
+web/mp4-keyer/  绿幕 mp4 转 sprite sheet 的本地网页工具(上传/预览/下载,node server.js)
 resource/       宠物素材(sprite sheet)
 scripts/        随程序发布的 Lua 示例脚本(maa/comfyui/tail_log/process_watch)
 icon.png        程序图标(托盘/窗口;部署时放到 exe 同目录)

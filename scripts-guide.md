@@ -69,7 +69,7 @@ end
 | `pet.config()` | 返回 `{ name, poll_ms, args }` | — |
 
 **约定**：
-- `session_id` 会被自动加 `script-<序号>-` 前缀(避免与 DSH/Hermes/MAA 串台),你只管用自己的 id
+- `session_id` 会被自动加 `script-<序号>-` 前缀(避免与 DSH/Hermes 串台),你只管用自己的 id
 - `question` 的 id 也会加前缀,保证全局唯一
 - 每个 `session_started` 对应一个 `session_ended`;`tool_started` 对应 `tool_ended`(否则状态机一直停在 working)
 - 会话 id 按"任务"分:不同任务用不同 id 即可看到多条会话轮流显示

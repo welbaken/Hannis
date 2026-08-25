@@ -324,9 +324,9 @@ pub fn run() {
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let (lo, hi) = (vx - w + 48, vx + vw - 48);
+            let (lo, hi) = (vx, vx + vw - w);
             x = px.clamp(lo.min(hi), lo.max(hi));
-            let (lo, hi) = (vy - h + 48, vy + vh - 48);
+            let (lo, hi) = (vy, vy + vh - h);
             y = py.clamp(lo.min(hi), lo.max(hi));
         }
         log_line(&format!("[gui] restore window pos ({x}, {y})"));
@@ -1154,12 +1154,13 @@ impl App {
             let (cx, cy) = window::cursor_pos();
             let (wx, wy, ww, wh) = self.window_size();
             let vis_bottom = wy + (wh - self.collapse_clip).max(0); // 裁剪线的屏幕 y
+            let off = self.pet_offset_x(); // 气泡让位:本体右移,bbox 起点随之右移
             let (hx0, hy0, hx1, hy1) = match self.avoid_box {
                 // 本体可见框(window-local)∩ 裁剪可见区
                 Some((bx, by, bw, bh)) => {
                     let top = wy + by;
                     let bottom = (wy + by + bh).min(vis_bottom);
-                    (wx + bx, top, wx + bx + bw, bottom.max(top))
+                    (wx + bx + off, top, wx + bx + off + bw, bottom.max(top))
                 }
                 None => (wx, wy, wx + ww, vis_bottom),
             };
@@ -1256,14 +1257,26 @@ impl App {
         });
     }
 
+    /// 气泡在左侧让出的空间(px):气泡右缘按动图宽度的固定百分比
+    /// (bubble::BUBBLE_RIGHT_FRACTION)定位;当气泡左缘越过本体左缘时,
+    /// 本体向右偏移该距离、窗口相应向左加宽,本体屏幕位置保持不变。
+    fn pet_offset_x(&self) -> i32 {
+        let (pet_w, _) = self.pet_size();
+        let dpi = self.comp.dpi_scale();
+        let bubble_w = bubble::scaled(bubble::MAX_BUBBLE_W, dpi) as f32;
+        let bx_rel = (pet_w as f32) * bubble::BUBBLE_RIGHT_FRACTION - bubble_w;
+        (-bx_rel).max(0.0).round() as i32
+    }
+
     /// Non-transparent pet rect in window-local coords (x_off, y_off, w, h).
     /// Falls back to the full window rect until an animation bbox is scanned.
     fn pet_visual_rect(&self) -> (i32, i32, i32, i32) {
-        if let Some(b) = self.avoid_box {
-            b
+        let off = self.pet_offset_x();
+        if let Some((bx, by, bw, bh)) = self.avoid_box {
+            (bx + off, by, bw, bh)
         } else {
             let (_, _, w, h) = self.window_size();
-            (0, 0, w, h)
+            (off, 0, w - off, h)
         }
     }
 
@@ -1275,9 +1288,9 @@ impl App {
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
             let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let (lo, hi) = (vx - w + 48, vx + vw - 48);
+            let (lo, hi) = (vx, vx + vw - w);
             let nx = x.clamp(lo.min(hi), lo.max(hi));
-            let (lo, hi) = (vy - h + 48, vy + vh - 48);
+            let (lo, hi) = (vy, vy + vh - h);
             let ny = y.clamp(lo.min(hi), lo.max(hi));
             (nx, ny)
         }
@@ -1300,11 +1313,21 @@ impl App {
         // 亚克力截屏需要窗口屏幕原点(compose 每次更新)
         let (wx, wy, _, _) = self.window_size();
         self.comp.set_screen_pos(wx, wy);
-        // The window is the pet plus a horizontal gutter on the left/right
-        // so the phone-style bubble at the top-left has room without
-        // crowding the character's face. The pet stays centered in the
-        // window; the bubble hangs at the top-left.
-        let win_w = pet_w + WINDOW_EXTRA_W;
+        // The window is the pet plus gutters: WINDOW_EXTRA_W of room on the
+        // right, and — when the pet is small enough that the bubble would
+        // reach past its left edge — the same amount of room reserved on the
+        // LEFT (the pet is offset right by that much). The bubble's right
+        // edge is anchored at a fixed FRACTION of the pet width (see
+        // BUBBLE_RIGHT_FRACTION), so the "pet body occludes the bubble's
+        // right sliver" look holds at every display scale; without the left
+        // gutter a small pet would sit fully on top of the bubble.
+        let dpi = self.comp.dpi_scale();
+        let bubble_w = bubble::scaled(bubble::MAX_BUBBLE_W, dpi) as f32;
+        // 气泡左缘(相对本体):右缘 = 动图宽 × 百分比,减掉气泡宽。
+        let bx_rel = (pet_w as f32) * bubble::BUBBLE_RIGHT_FRACTION - bubble_w;
+        let overhang = (-bx_rel).max(0.0).round() as u32;
+        let pet_x = overhang as i32;
+        let win_w = pet_w + WINDOW_EXTRA_W + overhang;
         let win_h = pet_h;
         let (old_x, old_y, old_w, old_h) = self.window_size();
         if win_w as i32 != old_w || win_h as i32 != old_h {
@@ -1320,8 +1343,8 @@ impl App {
         }
 
         self.comp.clear();
-        // 本体锚定在窗口左缘(用户确认的位置);窗口右侧保留 EXTRA 留白。
-        let pet_x = 0i32;
+        // 本体锚定在窗口左缘 + 气泡让位偏移(小 scale 时气泡伸到左侧);
+        // 窗口右侧保留 EXTRA 留白。
         let pet_y = 0i32;
         let alpha = self.fade_alpha * self.cfg.opacity_for(&self.mode);
 
@@ -1329,9 +1352,9 @@ impl App {
         // enlarged bubble may be partially occluded by the body — the pet
         // naturally covers whatever overlaps it (可以被本体遮挡一部分)。
         if self.bubble.visible() {
-            let dpi = self.comp.dpi_scale();
-            let bx = bubble::scaled(bubble::BUBBLE_MARGIN_X, dpi) as i32
-                + ((1.0 - self.bubble_fade) * 8.0) as i32; // 从宠物方向滑入
+            // 右缘 = 动图宽 × BUBBLE_RIGHT_FRACTION(与窗口 layout 同一公式,
+            // 加上本体让位偏移与滑入动画)。
+            let bx = pet_x + bx_rel.round() as i32 + ((1.0 - self.bubble_fade) * 8.0) as i32; // 从宠物方向滑入
             let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
             self.bubble.draw(&mut self.comp, bx, by, self.mode, self.bubble_fade);
         }

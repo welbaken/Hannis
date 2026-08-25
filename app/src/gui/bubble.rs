@@ -22,6 +22,13 @@ pub const PAD_BOTTOM: u32 = 8;
 /// center without being clipped by the window edge.
 pub const BUBBLE_MARGIN_X: u32 = 44;
 pub const BUBBLE_MARGIN_Y: u32 = 44;
+/// 气泡右缘在动图中的设计锚点:display.scale = 1.0、dpi = 1.0 时右缘位于
+/// BUBBLE_MARGIN_X + MAX_BUBBLE_W = 194px,即 800px 动图宽的 24.25%。
+/// 缩放比例变化时气泡右缘始终按该百分比定位(gui::compose),保证
+/// "本体只遮挡气泡右缘一小截"的遮挡关系不随 scale 改变——否则缩小后
+/// 气泡会横在本体下方,看起来像本体站到了气泡正上方。
+pub const BUBBLE_RIGHT_FRACTION: f32 =
+    (BUBBLE_MARGIN_X as f32 + MAX_BUBBLE_W as f32) / 800.0;
 /// Phone-screen proportions, enlarged 1.5×: a wider/taller portrait panel.
 /// It may extend under the pet body, which is fine (部分遮挡).
 ///pub const MAX_BUBBLE_W: u32 = 178;
@@ -121,9 +128,12 @@ impl Bubble {
         // fixed size regardless of the message
         let min_w = scaled(MIN_BUBBLE_W, s);
         let w = scaled(MAX_BUBBLE_W, s).min(pet_w.max(min_w));
-        let h = scaled(MAX_BUBBLE_H, s)
-            .min(pet_h.saturating_sub(scaled(BUBBLE_MARGIN_Y, s)))
-            .max(scaled(MIN_BUBBLE_H, s));
+        // 高度上限 = 动图高 − 顶部边距:气泡不得越过本体下缘,否则会被
+        // 窗口底部裁掉。小 scale / 高 DPI 下可用高度小于设计高时按上限
+        // 收缩——原来的 .max(MIN_BUBBLE_H) 会把高度回弹到设计值(350×DPI),
+        // 导致气泡下缘 394×DPI 超过动图高 800×scale 而被截断
+        // (150% DPI 时 scale ≤ 0.74 即触发,下缘被切掉 (394×1.5−800×s)px)。
+        let h = scaled(MAX_BUBBLE_H, s).min(pet_h.saturating_sub(scaled(BUBBLE_MARGIN_Y, s)));
         let text_w = w.saturating_sub(pad_x * 2).max(scaled(72, s));
         let text_h = h.saturating_sub(pad_top + pad_bottom).max(scaled(24, s));
 

@@ -454,11 +454,43 @@ impl Default for ScriptEntryConfig {
     }
 }
 
+/// 出厂默认接入口:DSH + Hermes(与迁移前的内置默认行为一致——没有 config.json
+/// 时自动生成的配置也会监控 DSH 与 Hermes)。MAA/ComfyUI 由随包发布的
+/// config.json 注册,不进默认(裸配置不该去连不存在的程序)。
+fn default_scripts() -> Vec<ScriptEntryConfig> {
+    vec![
+        ScriptEntryConfig {
+            name: "DSH".into(),
+            file: "scripts/dsh.lua".into(),
+            poll_ms: 1000,
+            args: Some(serde_json::json!({
+                "url": "http://127.0.0.1:3080",
+                "poll_ms": 2000,
+                "history_ms": 1000
+            })),
+            sandbox: false,
+            enabled: true,
+        },
+        ScriptEntryConfig {
+            name: "Hermes".into(),
+            file: "scripts/hermes.lua".into(),
+            poll_ms: 1000,
+            args: Some(serde_json::json!({
+                "db_path": null, // null = 自动解析(env HERMES_WEB_UI_HOME → 用户主目录)
+                "poll_ms_active": 1000,
+                "poll_ms_idle": 2000
+            })),
+            sandbox: false,
+            enabled: true,
+        },
+    ]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             auto_hide: AutoHideConfig::default(),
-            scripts: Vec::new(),
+            scripts: default_scripts(),
             display: DisplayConfig::default(),
             fade: FadeConfig {
                 fade_after_sec: 5,
@@ -658,11 +690,19 @@ mod tests {
 
     #[test]
     fn scripts_defaults_and_roundtrip() {
+        // 出厂默认:DSH + Hermes(自动生成的配置开箱即监控它们)
         let c = Config::default();
-        assert!(c.scripts.is_empty());
-        // 旧配置无 scripts 段 → 空
+        let names: Vec<&str> = c.scripts.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["DSH", "Hermes"]);
+        assert_eq!(c.scripts[0].file, "scripts/dsh.lua");
+        assert_eq!(c.scripts[1].file, "scripts/hermes.lua");
+        assert!(c.scripts[0].enabled && c.scripts[1].enabled);
+        // 旧配置/部分配置没写 scripts 段 → 同样补上默认接入口(开箱即监控
+        // DSH/Hermes,与迁移前的行为一致);显式 "scripts":[] 则尊重(用户可关)
         let old: Config = serde_json::from_str(r#"{"dsh":{"url":"http://x"}}"#).unwrap();
-        assert!(old.scripts.is_empty());
+        assert_eq!(old.scripts.len(), 2, "missing scripts field fills from Config::default()");
+        let explicit: Config = serde_json::from_str(r#"{"scripts":[]}"#).unwrap();
+        assert!(explicit.scripts.is_empty());
         // 注册项解析(name/file/poll_ms/args/sandbox)与默认值
         let c2: Config = serde_json::from_str(r#"{"scripts":[{"name":"A","file":"a.lua"}]}"#).unwrap();
         assert_eq!(c2.scripts.len(), 1);

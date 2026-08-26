@@ -4,13 +4,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Source {
-    #[default]
-    Dsh,
-    Hermes,
-    /// User-provided Lua scripts (connectors/lua.rs): id = registration index.
+    /// User-provided Lua scripts (connectors/lua.rs): id = registration index
+    /// in the `scripts` array. DSH/Hermes/MAA/ComfyUI 也是脚本(注册顺序即
+    /// 气泡平局时的优先顺序,DSH 注册在首位,延续"平局 DSH 赢")。
     Script(u16),
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Source::Script(0)
+    }
 }
 
 /// Script source labels: id -> display name (registered at spawn). A global
@@ -41,8 +46,6 @@ impl Source {
     /// Display name used in the bubble ("From <name>") and debug output.
     pub fn label(&self) -> String {
         match self {
-            Source::Dsh => "DSH".to_string(),
-            Source::Hermes => "Hermes".to_string(),
             Source::Script(id) => script_label(*id),
         }
     }
@@ -540,12 +543,6 @@ impl PetState {
             .or_insert_with(|| SessionState { source, ..Default::default() })
     }
 
-    pub fn set_queue_len(&mut self, n: u32) {
-        // legacy compatibility: treat as a generic (source-less) queue depth
-        self.queue_pending.insert(Source::Dsh, n);
-    }
-
-    /// Total pending work across all sources (ComfyUI queue / DSH session/queue).
     pub fn queue_len(&self) -> u32 {
         self.queue_pending.values().sum()
     }
@@ -678,7 +675,9 @@ impl PetState {
     }
 
     /// Bubble source selection (plan §5.4): among online sources pick the one
-    /// with the highest activity level; tie -> DSH.
+    /// with the highest activity level; tie -> the earliest-registered script
+    /// (BTreeMap iterates in Source order, so Script(0) — i.e. DSH, registered
+    /// first — wins ties, preserving the old "tie -> DSH" rule).
     pub fn select_bubble_source(&self) -> Option<Source> {
         let mut best: Option<(u8, Source)> = None;
         for (&source, &healthy) in &self.source_health {
@@ -691,9 +690,7 @@ impl PetState {
             let level: u8 = if active { 2 } else { 1 };
             let better = match best {
                 None => true,
-                Some((bl, bs)) => {
-                    level > bl || (level == bl && source == Source::Dsh && bs != Source::Dsh)
-                }
+                Some((bl, _)) => level > bl,
             };
             if better {
                 best = Some((level, source));
@@ -709,8 +706,8 @@ mod tests {
 
     fn base() -> PetState {
         let mut p = PetState::new(DEFAULT_DONE_MS, DEFAULT_FAIL_MS);
-        p.apply(StateEvent::SourceHealth { source: Source::Dsh, healthy: true });
-        p.apply(StateEvent::SourceHealth { source: Source::Hermes, healthy: true });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: true });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(1), healthy: true });
         p
     }
 
@@ -726,15 +723,15 @@ mod tests {
     #[test]
     fn offline_when_all_sources_down() {
         let mut p = base();
-        p.apply(StateEvent::SourceHealth { source: Source::Dsh, healthy: false });
-        p.apply(StateEvent::SourceHealth { source: Source::Hermes, healthy: false });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(1), healthy: false });
         assert_eq!(p.mode(), Mode::Offline);
     }
 
     #[test]
     fn one_source_up_keeps_pet_alive() {
         let mut p = base();
-        p.apply(StateEvent::SourceHealth { source: Source::Dsh, healthy: false });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
         assert_eq!(p.mode(), Mode::Idle);
     }
 
@@ -742,46 +739,46 @@ mod tests {
     fn priority_attention_over_working() {
         let mut p = base();
         p.apply(StateEvent::Poll {
-            source: Source::Dsh,
+            source: Source::Script(0),
             items: vec![poll_item("s1", true)],
             ok: true,
             error: None,
         });
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
-        p.apply(StateEvent::ToolStarted { source: Source::Dsh, session_id: "s1".into(), name: "bash".into(), arguments: None });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "bash".into(), arguments: None });
         assert_eq!(p.mode(), Mode::Working);
         p.apply(StateEvent::ApprovalRequested {
-            source: Source::Dsh,
+            source: Source::Script(0),
             id: "ap1".into(),
             session_id: "s1".into(),
             tool: "bash".into(),
         });
         assert_eq!(p.mode(), Mode::Attention);
-        p.apply(StateEvent::ApprovalResolved { source: Source::Dsh, id: "ap1".into() });
+        p.apply(StateEvent::ApprovalResolved { source: Source::Script(0), id: "ap1".into() });
         assert_eq!(p.mode(), Mode::Working);
     }
 
     #[test]
     fn question_resolved_clears_whole_request() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         // one ask() request with two question items, keyed as the DSH
         // connector does: `<rpcId>\u{0}<itemId>`
         p.apply(StateEvent::QuestionRequested {
-            source: Source::Dsh,
+            source: Source::Script(0),
             id: "r1\u{0}q1".into(),
             session_id: "s1".into(),
             text: "继续吗?".into(),
         });
         p.apply(StateEvent::QuestionRequested {
-            source: Source::Dsh,
+            source: Source::Script(0),
             id: "r1\u{0}q2".into(),
             session_id: "s1".into(),
             text: "选哪个?".into(),
         });
         assert_eq!(p.mode(), Mode::Attention);
         // user answers -> question/resolved carries only the request rpcId
-        p.apply(StateEvent::QuestionResolved { source: Source::Dsh, id: "r1".into() });
+        p.apply(StateEvent::QuestionResolved { source: Source::Script(0), id: "r1".into() });
         assert_eq!(p.snapshot().pending_questions.len(), 0);
         assert_eq!(p.mode(), Mode::Thinking); // the running turn is back on top
     }
@@ -789,20 +786,20 @@ mod tests {
     #[test]
     fn working_then_thinking_on_tool_end() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
-        p.apply(StateEvent::ToolStarted { source: Source::Dsh, session_id: "s1".into(), name: "web".into(), arguments: None });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "web".into(), arguments: None });
         assert_eq!(p.mode(), Mode::Working);
-        p.apply(StateEvent::ToolEnded { source: Source::Dsh, session_id: "s1".into(), name: "web".into(), error: false });
+        p.apply(StateEvent::ToolEnded { source: Source::Script(0), session_id: "s1".into(), name: "web".into(), error: false });
         assert_eq!(p.mode(), Mode::Thinking);
     }
 
     #[test]
     fn tool_start_clears_stale_live_text() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         // thinking stream accumulated before the tool call
         p.apply(StateEvent::LiveText {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             reasoning: Some("思考中…".into()),
             text: Some("让我先看看…".into()),
@@ -812,7 +809,7 @@ mod tests {
         assert_eq!(snap.thinking[0].live.text, "让我先看看…");
         // tool starts -> Working; the stale pre-tool stream must be gone so
         // the bubble falls back to the ⚙ tool label instead of old think text
-        p.apply(StateEvent::ToolStarted { source: Source::Dsh, session_id: "s1".into(), name: "bash".into(), arguments: None });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "bash".into(), arguments: None });
         assert_eq!(p.mode(), Mode::Working);
         let snap = p.snapshot();
         assert_eq!(snap.working.len(), 1);
@@ -820,7 +817,7 @@ mod tests {
         assert!(snap.working[0].live.reasoning.is_empty());
         // fresh content streamed after the tool started shows again
         p.apply(StateEvent::LiveText {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             reasoning: None,
             text: Some("新内容".into()),
@@ -833,9 +830,9 @@ mod tests {
     #[test]
     fn failed_window_expires() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Error,
@@ -848,9 +845,9 @@ mod tests {
     #[test]
     fn done_window_expires() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Completed,
@@ -863,15 +860,15 @@ mod tests {
     #[test]
     fn celebrate_done_shows_even_when_next_turn_starts() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Completed,
         });
         // next turn starts immediately - normally thinking would mask done
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 2 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 2 });
         assert_eq!(p.mode(), Mode::Done); // celebration window wins
         p.now_ms = DEFAULT_CELEBRATE_MS + 1;
         assert_eq!(p.mode(), Mode::Thinking); // after celebration, priority resumes
@@ -880,16 +877,16 @@ mod tests {
     #[test]
     fn celebrate_fail_beats_working() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Error,
         });
         // another session keeps working
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s2".into(), turn: 1 });
-        p.apply(StateEvent::ToolStarted { source: Source::Dsh, session_id: "s2".into(), name: "bash".into(), arguments: None });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s2".into(), turn: 1 });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s2".into(), name: "bash".into(), arguments: None });
         assert_eq!(p.mode(), Mode::Failed);
         // celebration expired but the regular fail window (fail_ms) still
         // outranks working
@@ -903,9 +900,9 @@ mod tests {
     #[test]
     fn aborted_is_neutral() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Aborted,
@@ -916,9 +913,9 @@ mod tests {
     #[test]
     fn blocked_counts_as_attention_candidate() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Blocked,
@@ -930,7 +927,7 @@ mod tests {
         assert!(s.waiting_user);
         // and a poll saying running=false must NOT turn this into "done"
         p.apply(StateEvent::Poll {
-            source: Source::Dsh,
+            source: Source::Script(0),
             items: vec![poll_item("s1", false)],
             ok: true,
             error: None,
@@ -942,12 +939,12 @@ mod tests {
     #[test]
     fn poll_running_false_is_done_fallback() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
-        p.apply(StateEvent::ToolStarted { source: Source::Dsh, session_id: "s1".into(), name: "bash".into(), arguments: None });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "bash".into(), arguments: None });
         assert_eq!(p.mode(), Mode::Working);
         // push gap: no turn/end event, poll flips to stopped
         p.apply(StateEvent::Poll {
-            source: Source::Dsh,
+            source: Source::Script(0),
             items: vec![poll_item("s1", false)],
             ok: true,
             error: None,
@@ -959,7 +956,7 @@ mod tests {
     fn ttl_cleans_old_approvals() {
         let mut p = base();
         p.apply(StateEvent::ApprovalRequested {
-            source: Source::Dsh,
+            source: Source::Script(0),
             id: "ap1".into(),
             session_id: "s1".into(),
             tool: "bash".into(),
@@ -974,19 +971,19 @@ mod tests {
     fn pending_sync_clears_only_that_source() {
         let mut p = base();
         p.apply(StateEvent::QuestionRequested {
-            source: Source::Dsh,
+            source: Source::Script(0),
             id: "r1\u{0}q1".into(),
             session_id: "s1".into(),
             text: "继续?".into(),
         });
         p.apply(StateEvent::QuestionRequested {
-            source: Source::Hermes,
+            source: Source::Script(1),
             id: "call_h1".into(),
             session_id: "h9".into(),
             text: "确认?".into(),
         });
         p.apply(StateEvent::ApprovalRequested {
-            source: Source::Dsh,
+            source: Source::Script(0),
             id: "ap1".into(),
             session_id: "s1".into(),
             tool: "bash".into(),
@@ -994,21 +991,21 @@ mod tests {
         assert_eq!(p.mode(), Mode::Attention);
         // server restarted: mux reconnect clears DSH pendings; the replay
         // re-adds whatever is still pending — here nothing DSH-side remains
-        p.apply(StateEvent::PendingSync { source: Source::Dsh });
+        p.apply(StateEvent::PendingSync { source: Source::Script(0) });
         let snap = p.snapshot();
         assert_eq!(snap.pending_questions.len(), 1); // hermes clarify survives
         assert_eq!(snap.pending_approvals.len(), 0);
         assert_eq!(p.mode(), Mode::Attention);
-        p.apply(StateEvent::PendingSync { source: Source::Hermes });
+        p.apply(StateEvent::PendingSync { source: Source::Script(1) });
         assert_eq!(p.mode(), Mode::Idle);
     }
 
     #[test]
     fn live_text_accumulates_and_clears_on_turn_end() {
         let mut p = base();
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::LiveText {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             reasoning: Some("思考中…".into()),
             text: Some("hello".into()),
@@ -1016,9 +1013,9 @@ mod tests {
         });
         let snap = p.snapshot();
         assert_eq!(snap.thinking[0].live.reasoning, "思考中…");
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::TurnEnded {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s1".into(),
             turn: 1,
             reason: TurnEndReason::Completed,
@@ -1028,32 +1025,32 @@ mod tests {
     }
 
     #[test]
-    fn bubble_source_prefers_active_then_dsh() {
+    fn bubble_source_prefers_active_then_earliest_registered() {
         let mut p = base();
-        // both idle -> DSH
-        assert_eq!(p.select_bubble_source(), Some(Source::Dsh));
-        // hermes active, dsh idle -> hermes
-        p.apply(StateEvent::TurnStarted { source: Source::Hermes, session_id: "h1".into(), turn: 1 });
-        assert_eq!(p.select_bubble_source(), Some(Source::Hermes));
-        // both active -> dsh
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "d1".into(), turn: 1 });
-        assert_eq!(p.select_bubble_source(), Some(Source::Dsh));
-        // dsh offline -> hermes
-        p.apply(StateEvent::SourceHealth { source: Source::Dsh, healthy: false });
-        assert_eq!(p.select_bubble_source(), Some(Source::Hermes));
+        // both idle -> earliest-registered script (Script(0), i.e. DSH)
+        assert_eq!(p.select_bubble_source(), Some(Source::Script(0)));
+        // script(1) active, script(0) idle -> active wins
+        p.apply(StateEvent::TurnStarted { source: Source::Script(1), session_id: "h1".into(), turn: 1 });
+        assert_eq!(p.select_bubble_source(), Some(Source::Script(1)));
+        // both active -> tie, earliest-registered wins
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "d1".into(), turn: 1 });
+        assert_eq!(p.select_bubble_source(), Some(Source::Script(0)));
+        // script(0) offline -> script(1)
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
+        assert_eq!(p.select_bubble_source(), Some(Source::Script(1)));
     }
 
     #[test]
     fn sessions_reaped_when_inactive_and_gone() {
         let mut p = base();
         p.apply(StateEvent::Poll {
-            source: Source::Dsh,
+            source: Source::Script(0),
             items: vec![poll_item("gone", false)],
             ok: true,
             error: None,
         });
         p.now_ms = DEFAULT_DONE_MS + 1;
-        p.apply(StateEvent::Poll { source: Source::Dsh, items: vec![], ok: true, error: None });
+        p.apply(StateEvent::Poll { source: Source::Script(0), items: vec![], ok: true, error: None });
         assert!(p.sessions.is_empty());
     }
 
@@ -1061,23 +1058,23 @@ mod tests {
     fn task_label_falls_back_to_user_message_and_todo() {
         let mut p = base();
         // no title: task = last user message
-        p.apply(StateEvent::UserMessage { source: Source::Dsh, session_id: "s1".into(), text: "修复webp闪烁".into() });
+        p.apply(StateEvent::UserMessage { source: Source::Script(0), session_id: "s1".into(), text: "修复webp闪烁".into() });
         let snap = p.snapshot();
         assert_eq!(snap.done.len(), 0); // not done yet, just check the info via thinking? use a done session instead
         // make it a completed session and inspect the task through snapshot
-        p.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s1".into(), turn: 1 });
-        p.apply(StateEvent::TurnEnded { source: Source::Dsh, session_id: "s1".into(), turn: 1, reason: TurnEndReason::Completed });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnEnded { source: Source::Script(0), session_id: "s1".into(), turn: 1, reason: TurnEndReason::Completed });
         let snap = p.snapshot();
         assert_eq!(snap.done[0].task.as_deref(), Some("修复webp闪烁"));
         // todo fallback when no user message
         let mut p2 = base();
         p2.apply(StateEvent::TodoSnapshot {
-            source: Source::Dsh,
+            source: Source::Script(0),
             session_id: "s2".into(),
             todos: vec![TodoItem { content: "部署服务".into(), status: "in_progress".into() }],
         });
-        p2.apply(StateEvent::TurnStarted { source: Source::Dsh, session_id: "s2".into(), turn: 1 });
-        p2.apply(StateEvent::TurnEnded { source: Source::Dsh, session_id: "s2".into(), turn: 1, reason: TurnEndReason::Completed });
+        p2.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s2".into(), turn: 1 });
+        p2.apply(StateEvent::TurnEnded { source: Source::Script(0), session_id: "s2".into(), turn: 1, reason: TurnEndReason::Completed });
         let snap = p2.snapshot();
         assert_eq!(snap.done[0].task.as_deref(), Some("部署服务"));
     }
@@ -1172,7 +1169,7 @@ mod tests {
     fn queue_depth_aggregates_across_sources() {
         let mut p = base();
         p.apply(StateEvent::QueueChanged { source: Source::Script(0), pending: 3 });
-        p.apply(StateEvent::QueueChanged { source: Source::Dsh, pending: 2 });
+        p.apply(StateEvent::QueueChanged { source: Source::Script(2), pending: 2 });
         assert_eq!(p.snapshot().queue_len, 5);
         p.apply(StateEvent::QueueChanged { source: Source::Script(0), pending: 0 });
         assert_eq!(p.snapshot().queue_len, 2);
@@ -1184,8 +1181,8 @@ mod tests {
         p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: true });
         assert_eq!(p.mode(), Mode::Idle);
         p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
-        p.apply(StateEvent::SourceHealth { source: Source::Dsh, healthy: false });
-        p.apply(StateEvent::SourceHealth { source: Source::Hermes, healthy: false });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
+        p.apply(StateEvent::SourceHealth { source: Source::Script(1), healthy: false });
         assert_eq!(p.mode(), Mode::Offline);
     }
 }

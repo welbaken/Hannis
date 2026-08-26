@@ -3,10 +3,15 @@
 > **读者**：AI 或开发者。**目标**：给这个桌面宠物程序接入一个新的消息来源
 > （另一个 agent 后端、聊天服务、消息平台等），复用现有状态机、气泡、动画体系。
 >
-> 阅读前建议先浏览 `app/src/state.rs`（事件契约）与本文件 §2，再动手。
-> 现有四种来源可作范本：`connectors/dsh.rs`（HTTP 轮询 + SSE/WS 流式）、
-> `connectors/hermes.rs`（SQLite 轮询 + 增量 diff）、`connectors/comfyui.rs`（仅队列）、
-> `connectors/maa.rs`（本地追加日志 tail，纯 std 无新依赖）。
+> **⚠️ 主要扩展方式已改为 Lua 脚本**：DSH、Hermes、MAA、ComfyUI 四个来源都已由内置
+> Rust 连接器迁移为 Lua 脚本（`scripts/*.lua`），用户无需编译即可接入新程序——
+> **请优先阅读 `scripts-guide.md`**（含 pet.* API、线格式参考、Lua 坑）。
+> 本文档保留为**内部架构 / StateEvent 契约**参考：脚本的 `pet.*` API 就是下表事件
+> 契约的镜像；只有需要改动宿主（`connectors/lua.rs`）或状态机本身时才读 Rust 部分。
+>
+> 现有四份脚本可作范本：`scripts/dsh.lua`（HTTP 轮询 + WebSocket + seq 增量）、
+> `scripts/hermes.lua`（SQLite 轮询 + 增量 diff）、`scripts/comfyui.lua`（HTTP 队列）、
+> `scripts/maa.lua`（本地追加日志 tail）。
 
 ---
 
@@ -32,22 +37,25 @@
 ```
 
 - **连接器 = 生产者**：每个来源 `spawn` 自己的线程，只做一件事——把上游数据翻译成
-  `StateEvent` 发进共享 channel。**绝不碰 UI、绝不做状态决策**。
+  `StateEvent` 发进共享 channel。**绝不碰 UI、绝不做状态决策**。（脚本来源见
+  `connectors/lua.rs`；DSH/Hermes/MAA/ComfyUI 的"生产者"现在就是 Lua 脚本本身。）
 - **状态机 = 消费者**：`PetState::apply(ev)` 累积会话状态；`snapshot()` 产出
   `Snapshot`（含 `Mode`）供 GUI 每帧取用。
-- 全部逻辑按 `Source` 枚举区分来源；新增来源 = 新增一个枚举变体 + 一个连接器模块。
+- 全部逻辑按 `Source` 枚举区分来源；`Source::Script(id)` 是唯一变体，id = `scripts`
+  数组下标。
 
 **文件地图**：
 
 | 文件 | 职责 |
 |---|---|
+| `scripts/*.lua` | **各来源连接器（主扩展方式，见 scripts-guide.md）** |
+| `app/src/connectors/lua.rs` | Lua 脚本宿主：每脚本一线程 + `pet.*` API 翻译为 StateEvent |
 | `app/src/state.rs` | `Source` / `Mode` / `StateEvent` / `PetState` / `Snapshot`（契约核心） |
 | `app/src/connectors/mod.rs` | `send()` / `sleep_interruptible()` / `stop_flag()` 公共助手 |
-| `app/src/connectors/<name>.rs` | 各来源连接器（照抄其模式） |
-| `app/src/http.rs` | 零依赖 HTTP/1.1 + WebSocket + SSE 客户端（新增连接器优先复用） |
+| `app/src/http.rs` | 零依赖 HTTP/1.1 + WebSocket + SSE 客户端（`pet.http/ws` 复用） |
 | `app/src/config.rs` | 配置段结构 + 默认值 |
 | `app/src/bubble_text.rs` | 气泡文案（标题行 / "From X" / 内容） |
-| `app/src/gui/mod.rs` | 连接器注册点（`run()`）与渲染 |
+| `app/src/gui/mod.rs` | 脚本注册点（`run()`）与渲染 |
 | `app/src/headless.rs` | 无 GUI 调试入口（**必须同步注册**，保持行为一致） |
 
 ---
@@ -218,32 +226,40 @@ fn parse_items(raw: &str) -> Vec<SessionItem> { /* … */ }
 - **复用 `http.rs`**：`Url::parse`、GET/POST、SSE、WebSocket 都有现成实现，零新依赖。
 - 需要 SQLite 时用 `rusqlite`（bundled，已存在）；**尽量不加新 crate**（exe 有体积预算）。
 
-### Step 3 — Source 枚举（`app/src/state.rs`）
+### Step 3 — 来源标识（现在就是 Lua 脚本）
+
+**主路径（Lua）**：在 `config.json` 的 `scripts` 数组追加一条，写一个 `.lua` 脚本，
+用 `pet.*` API 发事件。`Source::Script(id)` 是唯一来源变体（id = 数组下标），
+脚本名（`scripts[].name`）就是气泡 "From X"。**无需改 Rust、无需编译。**
+
+**改宿主（只有要动 `pet.*` API 本身时才需要）**：
 
 ```rust
 pub enum Source {
-    Dsh,
-    Hermes,
-    ComfyUi,
-    Xxx,               // ← 新增
+    Script(u16),   // id = scripts 数组下标(注册顺序)
 }
-// label() 是唯一的穷尽 match，编译错误会指出所有要补的地方
+// label() 查脚本名注册表(state.rs SCRIPT_LABELS);未注册显示 "Script N"
 ```
 
-`label()` 返回的名字会出现在气泡头部右侧："思考中… From Xxx"。
+> 脚本的 `pet.*` API（`connectors/lua.rs` 的 `build_pet_api`）就是 `StateEvent`
+> 契约的 Lua 镜像——给 `pet` 表加一个函数 = 给脚本加一种发事件的方式。
 
-### Step 4 — 注册（两处，必须都改）
+### Step 4 — 注册（Lua 主路径）
 
-`app/src/gui/mod.rs` 的 `run()`（约 204 行附近，ComfyUi 之后）：
+把脚本条目加进 `config.json` 的 `scripts` 数组即可；GUI 与 headless 都会按同一数组
+启动全部脚本（`app/src/gui/mod.rs` 的 `run()` / `app/src/headless.rs` 的 `drive()`、
+`debug_run()` 已统一遍历 `cfg.scripts`）。脚本可经托盘"接入口设置…"启停/改参，
+不需要改任何 Rust。
 
-```rust
-if cfg.xxx.enabled {
-    XxxConnector { url: cfg.xxx.url.clone(), poll_ms: cfg.xxx.poll_ms }
-        .spawn(tx.clone(), stop.clone());
-}
+```jsonc
+"scripts": [
+  { "name": "Xxx", "file": "scripts/xxx.lua", "poll_ms": 1000,
+    "args": { "url": "http://127.0.0.1:xxxx" } }
+]
 ```
 
-`app/src/headless.rs` 的 `drive()` 与 `debug_run()` 同样注册（调试入口行为必须与 GUI 一致）。
+> 只有新增 `pet.*` API 才需要动 `connectors/lua.rs`；加 API 后要在
+> `scripts-guide.md` 的 API 表同步补一行。
 
 ### Step 5 — 气泡文案（如需要定制）
 
@@ -256,8 +272,10 @@ if cfg.xxx.enabled {
 
 ### Step 6 — 测试
 
-1. **解析函数纯化**：`parse_events` / `parse_items` 不碰 I/O → 直接喂样例 JSON 断言
-   事件序列（参考 dsh.rs 测试：`handle_mux_frame` / `history_turn_and_tool_events` 等）。
+1. **解析函数纯化**：Lua 侧把解析/翻译写成纯函数 → 用样例 JSON/行直接喂（参考
+   `scripts/dsh.lua` 的 `apply_history`、`scripts/hermes.lua` 的 `pending_clarify`）。
+   宿主侧（`connectors/lua.rs`）已有脚本→事件序列的单元测试，新增 `pet.*` API 时
+   同步补一个。
 2. **状态机无需改**：`PetState` 的测试用注入时钟（`now_ms`）验证事件组合；
    新来源的事件与现有来源共用同一套语义。
 3. 运行：
@@ -266,7 +284,9 @@ if cfg.xxx.enabled {
 source .tools/env.sh && cd app
 cargo test --lib                                    # 单元测试
 cargo check --target x86_64-pc-windows-gnu          # Windows 目标编译检查
-cargo run -- --self-test                            # 素材自检（与连接器无关，但顺手验证）
+# Linux 下直接对真实目标联调(scripts 全启动):
+timeout 20 ./target/debug/hannis                    # headless:打印状态切换
+DSH_PET_DEBUG=1 ./target/debug/hannis               # 调试:打印每个脚本源的事件
 ```
 
 ### Step 7 — 冒烟验证
@@ -314,12 +334,14 @@ cargo run -- --self-test                            # 素材自检（与连接�
 
 | 想抄什么 | 看哪里 |
 |---|---|
-| 连接器最小骨架 / 健康翻转 | `connectors/dsh.rs` 的 `poll_loop`（约 79 行） |
-| 增量 diff 记忆 | `connectors/hermes.rs` 的 `PrevSession`（约 19 行） |
-| WS/SSE 流式 | `connectors/dsh.rs` 的 `stream_loop`（约 486 行）/ `connectors/comfyui.rs` 的 `ws_loop`（约 277 行） |
-| 纯解析 + 事件翻译 | `connectors/dsh.rs` 的 `handle_mux_frame`（约 586 行）/ `handle_host_frame`（约 683 行）/ `history_loop`（约 201 行） |
-| 仅队列来源（无会话） | `connectors/comfyui.rs` |
-| 本地文件 tail（纯 std，无新依赖） | `connectors/maa.rs`——追加式日志轮询 + 偏移量记忆 + 截断/清空检测 + 启动时尾部恢复 |
+| **Lua 脚本接入(主路径)** | `scripts-guide.md`(pet.* API / 线格式 / Lua 坑)+ `scripts/dsh.lua`(最全范本) |
+| 连接器骨架 / 健康翻转 / 轮询循环 | `scripts/dsh.lua` / `scripts/comfyui.lua` 主循环 |
+| 增量 diff 记忆 | `scripts/hermes.lua` 的 `prev` 表 |
+| WS 流式 + 重连 + pending_sync | `scripts/dsh.lua` 的 mux/host 段 + `ws_read` 三态 |
+| seq 增量 / 基线重建 | `scripts/dsh.lua` 的 `apply_history` |
+| 仅队列来源(无会话) | `scripts/comfyui.lua` |
+| 本地文件 tail | `scripts/maa.lua`——追加式日志轮询 + 偏移量记忆 + 截断/清空检测 |
+| pet.* API 宿主(加新 API) | `connectors/lua.rs` 的 `build_pet_api` |
 | 事件消费语义 | `state.rs` 的 `PetState::apply`（288 行起） |
 | 气泡源选择 / 平局规则 | `state.rs` 的 `select_bubble_source`（644 行） |
 | 气泡文案 | `bubble_text.rs` 的 `plain_bubble`（212 行）/ `live_parts`（273 行） |

@@ -1,6 +1,7 @@
 # Hannis — 独立桌面宠物(Windows)
 
-透明置顶悬浮窗宠物,实时监控 DSH / Hermes 以及任意脚本接入的程序(内置 MAA、ComfyUI 示例)。
+透明置顶悬浮窗宠物,实时监控 DSH / Hermes / MAA / ComfyUI 以及任意脚本接入的程序
+(DSH、Hermes、MAA、ComfyUI 均已由内置连接器迁移为 Lua 脚本,随程序发布)。
 单个 `Hannis.exe`,零运行时依赖(仅 Windows 系统 DLL),免安装。
 
 ## 快速开始
@@ -21,7 +22,7 @@ dist/
 |---|---|---|
 | idle | 无活动 | idle.sheet.png 完整循环 |
 | thinking | 会话生成中 | think.sheet.png,气泡实时显示思考内容 |
-| working | 工具/任务执行中 | working.sheet.png,气泡显示后端(DSH/Hermes)+ 工具名 + todo |
+| working | 工具/任务执行中 | working.sheet.png,气泡显示后端(DSH/Hermes 等)+ 工具名 + todo |
 | attention | 等待确认/提问(DSH 审批/提问,或 Hermes `clarify` 提问) | attention.sheet.png,气泡逐条列出 |
 | done / fail | 回合完成/出错 | done/fail.sheet.png;事件后**庆祝窗口 4s 强制置顶显示**,之后按窗口期(done 10s / fail 10s)继续 |
 | offline | 全部来源(DSH/Hermes/全部脚本)都断 | **idle 第 1 帧 + 灰度**(静态) |
@@ -41,9 +42,10 @@ dist/
 - **MAA / ComfyUI 内置源已脚本化**:MAA 与 ComfyUI 不再由内置 Rust 连接器提供,改为随程序发布的 Lua 脚本(行为与原内置版一致):
   - `scripts/maa.lua` — 监控 MAA `debug/gui.log`,由 `args.log` 指定路径;`args.attention_ms` 控制资深干员 attention 保持时长(默认 3000ms);`args.stream=true`(默认)时**任务期间的用户可见日志行**([TaskQueueViewModel],如「理智作战」的 开始行动/掉落统计、公招识别结果 等)会组装成信息流显示在气泡里,直到下一次 done/fail/attention。行为:正在连接模拟器=thinking、开始任务=working、任务链完成(`Idle: false to true (called from ProcTaskChainMsg)`)=done(整条链一次,链内「完成任务」行不单独触发)、已停止=fail、…资深干员…=attention(约 `attention_ms` 后自动消除);日志清空/截断=运行边界;启动时恢复 30 分钟内的未完成链
   - `scripts/comfyui.lua` — 轮询 ComfyUI `/queue` + `/history`(经 `pet.http`,无需外部工具),有任务在跑=working、成功=done、出错=fail、队列深度进气泡;服务不可达=该源不健康
-  - 两者都由 config.json `scripts` 数组注册(默认配置已含),与其它脚本一样会写 `hannis.log` 便于排查
+  - `scripts/dsh.lua` / `scripts/hermes.lua` — DSH 与 Hermes 连接器同样由内置 Rust 迁移为脚本(行为与原内置版一致,线格式见 `scripts-guide.md` §9)
+  - 四者都由 config.json `scripts` 数组注册(默认配置已含),与其它脚本一样会写 `hannis.log` 便于排查
 - **窗口**:Ctrl+滚轮缩放(0.25–2.0),拖拽移动;托盘右键可切换「回避模式」「自动收起」与「退出」(其余配置走 config.json)
-- **Lua 脚本接入(开放接口)**:在 config.json 的 `scripts` 数组注册任意 `.lua` 脚本即可把**任何程序**接入宠物——内嵌 Lua 5.4 已静态链接进 exe,用户只需会写 Lua、**无需安装任何运行时**。脚本在自己线程里轮询,通过 `pet.*` API 驱动状态机(与内置连接器同一套事件契约):`session_started/ended`、`tool_started/ended`、`live_text`、`question/answer`、`poll`、`todo`、`queue`、`health`、`log`、`wait`、`config`。脚本编译/运行出错只下线该脚本源,不影响宠物;`"sandbox": true` 可禁用文件/进程访问。详见 `scripts-guide.md`,示例:`scripts/tail_log.lua`(通用日志监控,关键词自定义)与 `scripts/process_watch.lua`(进程监控)
+- **Lua 脚本接入(开放接口)**:在 config.json 的 `scripts` 数组注册任意 `.lua` 脚本即可把**任何程序**接入宠物——内嵌 Lua 5.4 已静态链接进 exe,用户只需会写 Lua、**无需安装任何运行时**。脚本在自己线程里轮询,通过 `pet.*` API 驱动状态机(与内置连接器同一套事件契约):`session_started/ended`、`session_status`、`tool_started/ended`、`live_text`、`question/answer`、`approval_requested/resolved`、`pending_sync`、`poll`、`todo`、`queue`、`health`、`log`、`wait`、`config`、`http/http_post/ws/sqlite`。脚本编译/运行出错只下线该脚本源,不影响宠物;`"sandbox": true` 可禁用文件/进程/网络访问。详见 `scripts-guide.md`(含 DSH/Hermes 线格式参考),示例:`scripts/tail_log.lua`(通用日志监控,关键词自定义)与 `scripts/process_watch.lua`(进程监控)
 - **自动收起(auto-hide)**:托盘勾选「自动收起」后,idle/offline 持续超过 `auto_hide.after_sec`(默认 30 秒),宠物从原位**向下滑动**到任务栏区域(`slide_speed` px/s,默认 600,y = 屏幕高度 − `y_factor` × 窗口高度,默认 0.4)。**保持置顶**——头仍悬浮在所有窗口之上,被任务栏盖住的身体部分裁剪为透明(任务栏从透明区透出,看起来就是"身体被任务栏挡住");透明度在渐隐基础上再乘 `opacity`(默认 0.3);**鼠标点击穿透**(WS_EX_TRANSPARENT,可正常操作其下方的任务栏/桌面)。退出条件:有新消息(状态离开 idle/offline)或鼠标悬停超过 `hover_sec`(默认 3 秒,可设置)——**滑回原位**、恢复不透明度与完整绘制。纯窗口样式+位置实现,无额外权限/依赖
 - **滚轮拦截**:宠物上的滚轮事件一律被吞掉,不会透传给下层应用(Ctrl+滚轮=缩放宠物)
 - **回避模式(avoid)**:开启后宠物会自动躲开鼠标——光标靠近到 `avoid.distance` 范围内时,宠物快速跳开到 `avoid.shift` 像素外并保持;光标移出 `distance × hysteresis` 范围后,宠物平滑滑回原位。可在托盘右键勾选/取消,即时生效并写回 config.json
@@ -55,27 +57,34 @@ dist/
 
 ```jsonc
 {
-  // ---- DSH 连接器 ----
-  "dsh": {
-    "url": "http://127.0.0.1:3080",  // DSH 地址;环境变量 DSH_PET_URL 优先于此处
-    "poll_ms": 2000                  // session.list 轮询间隔(ms)
-    "history_ms": 1000               // session.history 轮询间隔(ms):DSH 实时思考/输出文字流与回合/工具事件的刷新粒度
-  },
-
-  // ---- Hermes 连接器 ----
-  "hermes": {
-    "db_path": null,          // Hermes 数据库路径;null=自动解析:
-                              //   env HERMES_WEB_UI_HOME(若设置) → %USERPROFILE%\.hermes-web-ui\hermes-web-ui.db
-                              // 解析失败则该源离线(设置面板已移除,改这里或环境变量)
-    "poll_ms_active": 1000,   // 有活跃会话时的轮询间隔(ms)——决定思考文本刷新频率
-    "poll_ms_idle": 2000      // 空闲时的轮询间隔(ms)
-  },
-
-  // ---- Lua 脚本(开放接口;MAA/ComfyUI 内置源已脚本化,见 scripts/ 与 scripts-guide.md)----
+  // ---- Lua 脚本(所有来源都是脚本:DSH/Hermes/MAA/ComfyUI 内置版已迁移,
+  //      见 scripts/ 与 scripts-guide.md)----
   "scripts": [
     {
+      "name": "DSH",                            // 气泡 "From DSH"
+      "file": "scripts/dsh.lua",                // DSH 连接器(session.list/history + events.mux/host)
+      "poll_ms": 1000,
+      "args": {
+        "url": "http://127.0.0.1:3080",         // DSH 地址;env DSH_PET_URL 优先
+        "poll_ms": 2000,                        // session.list 轮询间隔(ms)
+        "history_ms": 1000                      // session.history 轮询间隔(ms):实时思考/输出流与回合/工具事件的刷新粒度
+      }
+    },
+    {
+      "name": "Hermes",                         // 气泡 "From Hermes"
+      "file": "scripts/hermes.lua",             // Hermes 连接器(只读 SQLite 轮询)
+      "poll_ms": 1000,
+      "args": {
+        "db_path": null,                        // Hermes 数据库路径;null=自动解析:
+                                                //   env HERMES_WEB_UI_HOME(若设置) → %USERPROFILE%\.hermes-web-ui\hermes-web-ui.db
+                                                //   解析失败则该源离线
+        "poll_ms_active": 1000,                 // 有活跃会话时的轮询间隔(ms)——决定思考文本刷新频率
+        "poll_ms_idle": 2000                    // 空闲时的轮询间隔(ms)
+      }
+    },
+    {
       "name": "MAA",                            // 气泡 "From MAA"
-      "file": "scripts/maa.lua",                // 监控 MAA gui.log(行为与原内置版一致)
+      "file": "scripts/maa.lua",                // 监控 MAA gui.log
       "poll_ms": 1000,
       "args": {
         "log": "D:\\MeoAssistantArknights\\debug\\gui.log",
@@ -98,18 +107,16 @@ dist/
     "opacity": 0.3,           // 收起时额外透明度(0.05–1.0,叠加在渐隐系数上)
     "hover_sec": 3,           // 鼠标悬停宠物超过该秒数即恢复
     "slide_speed": 600        // 收起/恢复滑动速度(px/s)
-  },,
+  },
 
-  // ---- Lua 脚本(开放接口,详见 scripts-guide.md)----
-  "scripts": [
-    // {
-    //   "name": "MyGame",               // 气泡 "From MyGame"
-    //   "file": "scripts/tail_log.lua", // 脚本路径(相对 exe 目录)
-    //   "poll_ms": 1000,                // 提示值;脚本用 pet.config().poll_ms 读
-    //   "sandbox": false,               // true=禁用文件/进程访问
-    //   "args": { "log": "D:\\MyGame\\game.log" }  // 脚本通过 pet.config().args 读
-    // }
-  ],
+  // ---- 自定义 Lua 接入口(开放接口,详见 scripts-guide.md;在 scripts 数组里追加即可)----
+  // {
+  //   "name": "MyGame",               // 气泡 "From MyGame"
+  //   "file": "scripts/tail_log.lua", // 脚本路径(相对 exe 目录)
+  //   "poll_ms": 1000,                // 提示值;脚本用 pet.config().poll_ms 读
+  //   "sandbox": false,               // true=禁用文件/进程访问
+  //   "args": { "log": "D:\\MyGame\\game.log" }  // 脚本通过 pet.config().args 读
+  // },
 
   // ---- 显示与动画 ----
   "display": {
@@ -191,15 +198,18 @@ dist/
 
 **素材替换**:直接替换 `resource/` 下的 sprite sheet 即可(`<状态>.sheet.png` + `<状态>.sheet.json`,文件名即状态名);删除某个状态的素材会导致该状态空白。PNG 格式**两种都支持**:调色板(索引)PNG 更省内存(1 字节/像素 + tRNS alpha),RGBA PNG 会在加载时自动量化为 ≤256 色(alpha 无损)——建议用 `tools/make_sheets.js` 的 `--palette 256` 参数生成,效果与内置素材一致。**循环动画**:对任意非 idle 状态提供 `resource/<state>_loop.sheet.*`,动作播完一遍后自动无缝切到该循环(要求 loop 首帧衔接动作末帧、loop 自身无缝);不提供则回退尾部循环。sheet 由 `tools/make_sheets.js`(或 `tools/split_webp.py`)从源 webp 生成;运行期不再加载 webp。
 
-**环境变量**:
+**环境变量**（由 DSH/Hermes 脚本读取，见 `scripts-guide.md` §9.4）:
 | 变量 | 作用 |
 |---|---|
-| `DSH_PET_URL` | 覆盖 DSH 地址(优先于 config 的 dsh.url) |
-| `HERMES_WEB_UI_HOME` | 覆盖 Hermes 数据目录(优先于 config 的 hermes.db_path) |
+| `DSH_PET_URL` | 覆盖 DSH 地址(优先于 `scripts` 里 DSH 的 `args.url`) |
+| `HERMES_WEB_UI_HOME` | 覆盖 Hermes 数据目录(优先于 `scripts` 里 Hermes 的 `args.db_path`) |
 
 **图标**:托盘与窗口图标读取 exe 同目录的 `icon.png`(任意尺寸,按 32×32 缩放);缺失或解码失败时回退为内置的绿色圆点图标。
 
-**Hermes 数据通道说明**:宠物只读 Hermes 的 SQLite 数据库(`messages` 行在生成中增量写入:思考内容先行、正文随后,1s 轮询≈准流式),**不依赖 Hermes Studio 的 HTTP 网关**(8748)——Hermes 单独以 CLI 方式运行时同样可用。`hermes.db_path` 为空时自动解析数据目录。
+**Hermes 数据通道说明**:Hermes 连接器(现为 `scripts/hermes.lua`)只读 Hermes 的
+SQLite 数据库(`messages` 行在生成中增量写入:思考内容先行、正文随后,1s 轮询≈准流式),
+**不依赖 Hermes Studio 的 HTTP 网关**(8748)——Hermes 单独以 CLI 方式运行时同样可用。
+`args.db_path` 为空时自动解析数据目录(env `HERMES_WEB_UI_HOME` → 用户主目录)。
 
 **Hermes 等待确认检测**:Hermes 调用交互工具 `clarify`(向用户提问/给出选项)时,数据库里会先出现一条 `finish_reason=tool_calls` 的 assistant 消息,答案结果行要等用户回复后才写入——宠物把这段"提问未答"的空档识别为 **attention(等待确认)**,气泡列出问题与选项;用户回答(结果行落库)或会话结束后自动恢复。普通工具调用(非 clarify)不会误判为等待确认。
 
@@ -208,10 +218,11 @@ dist/
 1. 启动 DSH(127.0.0.1:3080)与 Hermes Studio,再启动 Hannis.exe
 2. 无活动 → idle 动画循环;鼠标移开后 5s 渐隐,移回恢复
 3. 让任一 agent 跑一个会话 → 气泡出现 [DSH]/[Hermes] 标签、思考内容实时滚动,宠物切 thinking/working
-4. 关闭 DSH 和 Hermes → 宠物变灰度静态(idle 首帧);重启任一 → 恢复动画
+4. 关闭 DSH 和 Hermes → 宠物变灰度静态(idle 首帧);重启任一 → 恢复动画(各来源均为 Lua 脚本,单源断线只让该源下线)
 5. 拖拽宠物 → move.sheet.png(切换动画不消失);**拖拽松手后位置写入 config 的 window_pos,重启后恢复**;Ctrl+滚轮缩放(滚轮不会影响下层应用);修改 config.json 后重启生效
 6. 托盘右键勾选「回避模式」→ 鼠标靠近宠物,宠物弹开到一侧并持续躲开;鼠标移远后宠物滑回原位;再在托盘取消勾选即关闭
 7. (MAA)启动 MAA 跑任务链 → 宠物跟随后台:正在连接模拟器=think,开始任务=working,任务链完成=done(整条链一次),已停止=fail;任务管理器确认 idle 时内存 ≈80MB、CPU 基本归零
+8. (接入口设置)托盘 → "接入口设置…" → 每个脚本一行(启停药丸 + 参数编辑框,来自脚本内 `--[hannis:set]` 声明),保存后写回 config.json 并热重启对应脚本
 
 ## 构建
 
@@ -235,11 +246,11 @@ cargo build --release --target x86_64-pc-windows-gnu   # 或见 build.ps1 等价
 ### 测试
 
 ```bash
-cd app && cargo test    # 单测:状态机/播放调度/sheet 加载/连接器帧解析/气泡文本/打字机
-# Linux 下可直接对真实 DSH 联调:
+cd app && cargo test    # 单测:状态机/播放调度/sheet 加载/脚本连接器/气泡文本/打字机
+# Linux 下可直接对真实 DSH 联调(config.json 的 scripts 会全部启动):
 cd app && cargo run -- --self-test   # 素材解码自检
 timeout 20 ./target/debug/hannis     # headless:打印状态切换(连接真实 DSH/Hermes)
-DSH_PET_DEBUG=1 ./target/debug/hannis  # 调试:打印每个连接器事件(排查流式问题)
+DSH_PET_DEBUG=1 ./target/debug/hannis  # 调试:打印每个脚本源的事件(排查流式问题)
 ```
 
 ## 素材打包

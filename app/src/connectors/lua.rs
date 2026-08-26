@@ -302,6 +302,62 @@ impl LuaScriptConnector {
         };
         pet.set("answer", f)?;
 
+        // pet.session_status(id, running):running 翻转(host/session-status、hermes 会话结束)
+        let f = {
+            let tx = tx.clone();
+            let sid = sid.clone();
+            lua.create_function(move |_, (id, running): (String, bool)| {
+                send(&tx, StateEvent::SessionStatus {
+                    source,
+                    session_id: sid(id),
+                    running,
+                });
+                Ok(())
+            })?
+        };
+        pet.set("session_status", f)?;
+
+        // pet.approval_requested(aid, id, tool)/pet.approval_resolved(aid):
+        // DSH events.mux 的 approval/requested|resolved(id 自动加前缀)
+        let f = {
+            let tx = tx.clone();
+            let sid = sid.clone();
+            let prefix = prefix.clone();
+            lua.create_function(move |_, (aid, id, tool): (String, String, String)| {
+                send(&tx, StateEvent::ApprovalRequested {
+                    source,
+                    id: format!("{prefix}{aid}"),
+                    session_id: sid(id),
+                    tool,
+                });
+                Ok(())
+            })?
+        };
+        pet.set("approval_requested", f)?;
+        let f = {
+            let tx = tx.clone();
+            let prefix = prefix.clone();
+            lua.create_function(move |_, aid: String| {
+                send(&tx, StateEvent::ApprovalResolved {
+                    source,
+                    id: format!("{prefix}{aid}"),
+                });
+                Ok(())
+            })?
+        };
+        pet.set("approval_resolved", f)?;
+
+        // pet.pending_sync():WS 重连后清空该源的审批/提问(服务端会重放当前
+        // 仍在等待的请求;本地残留的已失效请求不能把宠物卡在 attention 上)
+        let f = {
+            let tx = tx.clone();
+            lua.create_function(move |_, _: ()| {
+                send(&tx, StateEvent::PendingSync { source });
+                Ok(())
+            })?
+        };
+        pet.set("pending_sync", f)?;
+
         let f = {
             let tx = tx.clone();
             let sid = sid.clone();
@@ -457,9 +513,13 @@ impl LuaScriptConnector {
             })?
         };
         pet.set("ws", f)?;
+        // 返回值三态:
+        //   string = 收到一帧文本/二进制
+        //   nil    = 读超时(连接还活着,只是这个时间窗内没有新帧)
+        //   false  = 连接已关闭/出错(脚本应 ws_close + 重连)
         let f = {
             let reg = ws_reg.clone();
-            lua.create_function(move |_, id: i64| {
+            lua.create_function(move |lua, id: i64| {
                 let mut reg = reg.lock().unwrap();
                 let ws = reg
                     .get_mut(&(id as u64))
@@ -468,14 +528,15 @@ impl LuaScriptConnector {
                     match ws.read_frame() {
                         Ok(fr) => {
                             if fr.opcode == crate::http::WS_OP_TEXT || fr.opcode == crate::http::WS_OP_BINARY {
-                                return Ok(Some(String::from_utf8_lossy(&fr.payload).to_string()));
+                                return Ok(Value::String(lua.create_string(&fr.payload)?));
                             }
                             if fr.opcode == crate::http::WS_OP_CLOSE {
-                                return Ok(None);
+                                return Ok(Value::Boolean(false)); // 对端关闭
                             }
                             // ping/pong 等控制帧:继续等
                         }
-                        Err(_) => return Ok(None), // 超时/关闭/错误
+                        Err(crate::http::WsError::Timeout) => return Ok(Value::Nil), // 超时:无新帧
+                        Err(_) => return Ok(Value::Boolean(false)),                   // 关闭/错误:连接死了
                     }
                 }
             })?
@@ -719,6 +780,25 @@ mod tests {
     }
 
     #[test]
+    fn session_status_approval_and_pending_sync() {
+        let (_d, p) = tmp_script(
+            r#"
+            pet.session_status("s1", true)
+            pet.approval_requested("a1", "s1", "bash")
+            pet.approval_resolved("a1")
+            pet.pending_sync()
+            "#,
+        );
+        let evs = run_script(entry(p, "StateApp"), 20);
+        assert!(evs.iter().any(|e| matches!(e, StateEvent::SessionStatus { session_id, running, .. }
+            if session_id == "script-20-s1" && *running)));
+        assert!(evs.iter().any(|e| matches!(e, StateEvent::ApprovalRequested { id, session_id, tool, .. }
+            if id == "script-20-a1" && session_id == "script-20-s1" && tool == "bash")));
+        assert!(evs.iter().any(|e| matches!(e, StateEvent::ApprovalResolved { id, .. } if id == "script-20-a1")));
+        assert!(evs.iter().any(|e| matches!(e, StateEvent::PendingSync { source: Source::Script(20) })));
+    }
+
+    #[test]
     fn runtime_error_marks_unhealthy_and_does_not_panic() {
         let (_d, p) = tmp_script("pet.health(true)\nerror('boom')\n");
         let evs = run_script(entry(p, "ErrApp"), 3);
@@ -789,7 +869,8 @@ mod tests {
         assert_eq!(Source::Script(10).label(), "我的程序");
         // unregistered ids fall back to a placeholder
         assert_eq!(Source::Script(65535).label(), "Script 65535");
-        assert_eq!(Source::Dsh.label(), "DSH");
+        // 内置源已全部迁移为脚本:未注册的 id 显示占位名
+        assert_eq!(Source::Script(60000).label(), "Script 60000");
     }
 
     #[test]
@@ -867,7 +948,7 @@ mod tests {
              local f = pet.ws_read(h)\n\
              assert(f == 'hi', tostring(f))\n\
              local f2 = pet.ws_read(h)\n\
-             assert(f2 == nil)\n\
+             assert(f2 == false, tostring(f2)) -- close frame -> false (not nil)\n\
              pet.ws_close(h)\n",
         );
         let (_d, p) = tmp_script(&script);

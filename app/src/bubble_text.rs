@@ -199,7 +199,8 @@ pub fn bubble_text_pinned(
 ) -> BubbleText {
     match snap.mode {
         Mode::Working | Mode::Thinking => {
-            let src = source.unwrap_or(Source::Dsh);
+            // 兜底 = 第一个注册的脚本(即 DSH);GUI 总会传入实际选中的源
+            let src = source.unwrap_or(Source::Script(0));
             let (title, content) = live_parts(snap, source, snap.mode, prefer, reveal, max_line);
             let lines = content.map(|c| vec![c]).unwrap_or_default();
             BubbleText { title, from: Some(src.label().to_string()), lines }
@@ -212,7 +213,7 @@ pub fn bubble_text_pinned(
 fn plain_bubble(snap: &Snapshot, source: Option<Source>) -> BubbleText {
     match snap.mode {
         Mode::Offline => BubbleText {
-            title: "连不上 DSH 和 Hermes 😢".to_string(),
+            title: "连不上任何接入口 😢".to_string(),
             from: None,
             lines: vec!["自动重试中…".to_string()],
         },
@@ -252,7 +253,7 @@ fn plain_bubble(snap: &Snapshot, source: Option<Source>) -> BubbleText {
                 .collect(),
         },
         Mode::Idle => {
-            let src = source.unwrap_or(Source::Dsh);
+            let src = source.unwrap_or(Source::Script(0));
             let lines = if snap.queue_len > 0 {
                 vec![format!("队列中还有 {} 个任务待处理", snap.queue_len)]
             } else {
@@ -412,16 +413,16 @@ mod tests {
         let mut s = snap(Mode::Attention);
         s.thinking.push(SessionInfo {
             title: "继续中断的对话".into(),
-            ..sess("mswfow6bou90rb", Source::Hermes)
+            ..sess("mswfow6bou90rb", Source::Script(1))
         });
         s.pending_questions.push(("mswfow6bou90rb".into(), "如何处理?（重启 / 放弃）".into(), String::new()));
-        let b = bt(&s, Some(Source::Hermes));
+        let b = bt(&s, Some(Source::Script(1)));
         assert!(b.title.contains("需要你确认 · 1 项"));
         assert!(b.lines.iter().any(|x| x.contains("继续中断的对话")));
         assert!(!b.lines.iter().any(|x| x.contains("mswfow6bou90rb")));
         // unknown session id falls back to the raw id
         s.pending_questions.push(("unknown-id".into(), "继续吗?".into(), String::new()));
-        let b = bt(&s, Some(Source::Hermes));
+        let b = bt(&s, Some(Source::Script(1)));
         assert!(b.lines.iter().any(|x| x.contains("unknown-id")));
     }
 
@@ -434,9 +435,10 @@ mod tests {
 
     #[test]
     fn working_shows_backend_and_tool() {
+        crate::state::register_script_label(0, "DSH".to_string());
         let mut s = snap(Mode::Working);
-        s.working.push(SessionInfo { tool: Some("bash".into()), ..sess("s1", Source::Dsh) });
-        let b = bt(&s, Some(Source::Dsh));
+        s.working.push(SessionInfo { tool: Some("bash".into()), ..sess("s1", Source::Script(0)) });
+        let b = bt(&s, Some(Source::Script(0)));
         assert_eq!(b.title, "正在干活…");
         assert_eq!(b.from.as_deref(), Some("DSH"));
         assert_eq!(b.lines.len(), 1); // one line at a time
@@ -449,43 +451,43 @@ mod tests {
         // work started earliest (deepest into the task) wins the bubble,
         // not whichever session id sorts first
         let mut s = snap(Mode::Working);
-        s.working.push(SessionInfo { tool: Some("read".into()), ..sess("zz-new", Source::Dsh) });
-        s.working.push(SessionInfo { tool: Some("bash".into()), ..sess("aa-old", Source::Dsh) });
+        s.working.push(SessionInfo { tool: Some("read".into()), ..sess("zz-new", Source::Script(0)) });
+        s.working.push(SessionInfo { tool: Some("bash".into()), ..sess("aa-old", Source::Script(0)) });
         s.working_since.insert("zz-new".into(), 2000);
         s.working_since.insert("aa-old".into(), 1000);
-        let b = bt(&s, Some(Source::Dsh));
+        let b = bt(&s, Some(Source::Script(0)));
         assert!(b.lines[0].contains("bash"), "expected earliest-started tool, got: {}", b.lines[0]);
         // live text still outranks the earliest-start rule
         s.working[0].live.text = "新流出的内容".into();
-        let b = bt(&s, Some(Source::Dsh));
+        let b = bt(&s, Some(Source::Script(0)));
         assert!(b.lines[0].contains("新流出的内容"));
     }
 
     #[test]
     fn rotate_pick_keeps_fresh_and_moves_stale() {
         let mut s = snap(Mode::Working);
-        s.working.push(SessionInfo { tool: Some("bash".into()), ..sess("a", Source::Dsh) });
-        s.working.push(SessionInfo { tool: Some("read".into()), ..sess("b", Source::Dsh) });
+        s.working.push(SessionInfo { tool: Some("bash".into()), ..sess("a", Source::Script(0)) });
+        s.working.push(SessionInfo { tool: Some("read".into()), ..sess("b", Source::Script(0)) });
         s.working_since.insert("a".into(), 1000);
         s.working_since.insert("b".into(), 2000);
         // fresh message: the current session stays
-        assert_eq!(rotate_pick(&s, Some(Source::Dsh), Mode::Working, Some("a"), false), Some("a".into()));
+        assert_eq!(rotate_pick(&s, Some(Source::Script(0)), Mode::Working, Some("a"), false), Some("a".into()));
         // stale + another candidate: moves to it
-        assert_eq!(rotate_pick(&s, Some(Source::Dsh), Mode::Working, Some("a"), true), Some("b".into()));
+        assert_eq!(rotate_pick(&s, Some(Source::Script(0)), Mode::Working, Some("a"), true), Some("b".into()));
         // stale but the current session is the only candidate: stays
         let mut s1 = snap(Mode::Working);
-        s1.working.push(SessionInfo { tool: Some("bash".into()), ..sess("a", Source::Dsh) });
-        assert_eq!(rotate_pick(&s1, Some(Source::Dsh), Mode::Working, Some("a"), true), Some("a".into()));
+        s1.working.push(SessionInfo { tool: Some("bash".into()), ..sess("a", Source::Script(0)) });
+        assert_eq!(rotate_pick(&s1, Some(Source::Script(0)), Mode::Working, Some("a"), true), Some("a".into()));
         // no valid current: normal preference (live text first, else earliest)
-        assert_eq!(rotate_pick(&s, Some(Source::Dsh), Mode::Working, None, false), Some("a".into()));
+        assert_eq!(rotate_pick(&s, Some(Source::Script(0)), Mode::Working, None, false), Some("a".into()));
         // a thinking session with live text is a rotation candidate too
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: "在想事情…".into(), ..LiveText::default() },
-            ..sess("c", Source::Dsh)
+            ..sess("c", Source::Script(0))
         });
-        assert_eq!(rotate_pick(&s, Some(Source::Dsh), Mode::Working, Some("a"), true), Some("c".into()));
+        assert_eq!(rotate_pick(&s, Some(Source::Script(0)), Mode::Working, Some("a"), true), Some("c".into()));
         // pinned rendering follows the rotation pick
-        let b = bubble_text_pinned(&s, Some(Source::Dsh), Some("c"), None, MAX_LINE);
+        let b = bubble_text_pinned(&s, Some(Source::Script(0)), Some("c"), None, MAX_LINE);
         assert!(b.lines[0].contains("在想事情"));
     }
 
@@ -498,9 +500,9 @@ mod tests {
         s.working.push(SessionInfo {
             tool: Some("bash".into()),
             live: LiveText { reasoning: String::new(), text: "正在输出的正文".into(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bt(&s, Some(Source::Dsh));
+        let b = bt(&s, Some(Source::Script(0)));
         assert_eq!(b.lines.len(), 1);
         assert!(b.lines[0].contains("正在输出的正文"));
         assert!(!b.lines[0].contains("bash"));
@@ -512,9 +514,9 @@ mod tests {
         s.working.push(SessionInfo {
             tool: Some("bash".into()),
             tool_args: Some("ls -la /tmp".into()),
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bt(&s, Some(Source::Dsh));
+        let b = bt(&s, Some(Source::Script(0)));
         assert!(b.lines[0].contains("bash"));
         assert!(b.lines[0].contains("ls -la /tmp"));
     }
@@ -525,15 +527,15 @@ mod tests {
         let long = "开头".repeat(200); // > MAX_LINE chars
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: long.clone(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let l1 = bt(&s, Some(Source::Dsh)).lines;
+        let l1 = bt(&s, Some(Source::Script(0))).lines;
         let mut s2 = snap(Mode::Thinking);
         s2.thinking.push(SessionInfo {
             live: LiveText { reasoning: format!("{long}新增内容"), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let l2 = bt(&s2, Some(Source::Dsh)).lines;
+        let l2 = bt(&s2, Some(Source::Script(0))).lines;
         // the visible line changes as the stream grows (tail scrolling)
         assert_ne!(l1[0], l2[0]);
         assert!(l2[0].contains("新增内容"));
@@ -545,9 +547,9 @@ mod tests {
         let mut s = snap(Mode::Done);
         s.done.push(SessionInfo {
             task: Some("修复webp闪烁像素".into()),
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bt(&s, Some(Source::Dsh));
+        let b = bt(&s, Some(Source::Script(0)));
         assert!(b.title.contains("任务完成"));
         assert!(b.lines.iter().any(|x| x.contains("修复webp闪烁像素")));
     }
@@ -563,7 +565,7 @@ mod tests {
         assert!(b.lines[0].contains("3"));
         // empty queue falls back to the plain idle line
         let s2 = snap(Mode::Idle);
-        let b2 = bt(&s2, Some(Source::Dsh));
+        let b2 = bt(&s2, Some(Source::Script(0)));
         assert!(b2.lines[0].contains("没有运行中的任务"));
     }
 
@@ -572,9 +574,9 @@ mod tests {
         let mut s = snap(Mode::Thinking);
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: "思考中文字流…".into(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Hermes)
+            ..sess("s1", Source::Script(1))
         });
-        let b = bt(&s, Some(Source::Hermes));
+        let b = bt(&s, Some(Source::Script(1)));
         assert_eq!(b.lines.len(), 1);
         assert!(b.lines[0].contains("思考中文字流"));
     }
@@ -582,9 +584,9 @@ mod tests {
     #[test]
     fn working_filters_other_source_when_selected() {
         let mut s = snap(Mode::Working);
-        s.working.push(SessionInfo { tool: Some("t1".into()), ..sess("d1", Source::Dsh) });
-        s.working.push(SessionInfo { tool: Some("t2".into()), ..sess("h1", Source::Hermes) });
-        let b = bt(&s, Some(Source::Hermes));
+        s.working.push(SessionInfo { tool: Some("t1".into()), ..sess("d1", Source::Script(0)) });
+        s.working.push(SessionInfo { tool: Some("t2".into()), ..sess("h1", Source::Script(1)) });
+        let b = bt(&s, Some(Source::Script(1)));
         assert!(b.lines[0].contains("t2"));
         assert!(!b.lines[0].contains("t1"));
     }
@@ -594,9 +596,9 @@ mod tests {
         let mut s = snap(Mode::Thinking);
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: "x".repeat(500), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bt(&s, Some(Source::Dsh));
+        let b = bt(&s, Some(Source::Script(0)));
         assert!(b.lines[0].contains('…'));
     }
 
@@ -605,16 +607,16 @@ mod tests {
         let mut s = snap(Mode::Thinking);
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: "正在推导方案".into(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Hermes)
+            ..sess("s1", Source::Script(1))
         });
-        let b0 = bubble_text_pinned(&s, Some(Source::Hermes), None, Some(0), MAX_LINE);
+        let b0 = bubble_text_pinned(&s, Some(Source::Script(1)), None, Some(0), MAX_LINE);
         assert_eq!(b0.lines[0], "🧠 ");
-        let b2 = bubble_text_pinned(&s, Some(Source::Hermes), None, Some(2), MAX_LINE);
+        let b2 = bubble_text_pinned(&s, Some(Source::Script(1)), None, Some(2), MAX_LINE);
         assert!(b2.lines[0].ends_with("正在"));
         assert!(!b2.lines[0].contains("推导"));
         // reveal >= len -> identical to the plain line
-        let full = bt(&s, Some(Source::Hermes));
-        let lfull = bubble_text_pinned(&s, Some(Source::Hermes), None, Some(100), MAX_LINE);
+        let full = bt(&s, Some(Source::Script(1)));
+        let lfull = bubble_text_pinned(&s, Some(Source::Script(1)), None, Some(100), MAX_LINE);
         assert_eq!(lfull, full);
         assert!(full.lines[0].ends_with("正在推导方案"));
     }
@@ -625,11 +627,11 @@ mod tests {
         let long: String = "字".repeat(200); // > MAX_LINE
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: long.clone(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
         // revealed 150 of 200 chars: shows the tail of the revealed prefix,
         // i.e. chars [150-120, 150) with a leading ellipsis
-        let b = bubble_text_pinned(&s, Some(Source::Dsh), None, Some(150), MAX_LINE);
+        let b = bubble_text_pinned(&s, Some(Source::Script(0)), None, Some(150), MAX_LINE);
         assert!(b.lines[0].starts_with("🧠 …"));
         assert!(b.lines[0].contains('字'));
         assert!(b.lines[0].chars().count() < 200);
@@ -643,10 +645,10 @@ mod tests {
         let long: String = "字".repeat(300);
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: long.clone(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bubble_text_pinned(&s, Some(Source::Dsh), None, None, 120);
-        let w = bubble_text_pinned(&s, Some(Source::Dsh), None, None, 300);
+        let b = bubble_text_pinned(&s, Some(Source::Script(0)), None, None, 120);
+        let w = bubble_text_pinned(&s, Some(Source::Script(0)), None, None, 300);
         assert_eq!(w.lines[0].chars().count() - "🧠 ".chars().count(), 300);
         assert!(w.lines[0].chars().count() > b.lines[0].chars().count());
         assert!(!w.lines[0].contains('…')); // nothing dropped yet
@@ -654,18 +656,20 @@ mod tests {
 
     #[test]
     fn bubble_text_header_title_from_and_stream() {
+        crate::state::register_script_label(0, "DSH".to_string());
+        crate::state::register_script_label(1, "Hermes".to_string());
         let mut s = snap(Mode::Thinking);
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: "正在推导…".into(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Hermes)
+            ..sess("s1", Source::Script(1))
         });
-        let b = bubble_text_pinned(&s, Some(Source::Hermes), None, None, MAX_LINE);
+        let b = bubble_text_pinned(&s, Some(Source::Script(1)), None, None, MAX_LINE);
         assert_eq!(b.title, "思考中…");
         assert_eq!(b.from.as_deref(), Some("Hermes"));
         assert_eq!(b.lines, vec!["🧠 正在推导…"]);
         // no session picked: title only, no stream lines
         let s2 = snap(Mode::Thinking);
-        let b = bubble_text_pinned(&s2, Some(Source::Dsh), None, None, MAX_LINE);
+        let b = bubble_text_pinned(&s2, Some(Source::Script(0)), None, None, MAX_LINE);
         assert_eq!(b.title, "思考中…");
         assert_eq!(b.from.as_deref(), Some("DSH"));
         assert!(b.lines.is_empty());
@@ -673,13 +677,14 @@ mod tests {
 
     #[test]
     fn bubble_text_working_tool_below_header() {
+        crate::state::register_script_label(0, "DSH".to_string());
         let mut s = snap(Mode::Working);
         s.working.push(SessionInfo {
             tool: Some("bash".into()),
             tool_args: Some("ls -la /tmp".into()),
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bubble_text_pinned(&s, Some(Source::Dsh), None, None, MAX_LINE);
+        let b = bubble_text_pinned(&s, Some(Source::Script(0)), None, None, MAX_LINE);
         assert_eq!(b.title, "正在干活…");
         assert_eq!(b.from.as_deref(), Some("DSH"));
         assert!(b.lines[0].contains("bash"));
@@ -688,12 +693,13 @@ mod tests {
 
     #[test]
     fn bubble_text_done_shows_title_and_items() {
+        crate::state::register_script_label(0, "DSH".to_string());
         let mut s = snap(Mode::Done);
         s.done.push(SessionInfo {
             task: Some("修复webp闪烁像素".into()),
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let b = bubble_text_pinned(&s, Some(Source::Dsh), None, None, MAX_LINE);
+        let b = bubble_text_pinned(&s, Some(Source::Script(0)), None, None, MAX_LINE);
         assert_eq!(b.title, "任务完成啦 🎉");
         assert_eq!(b.from, None);
         assert!(b.lines[0].contains("修复webp闪烁像素"));
@@ -716,10 +722,10 @@ mod tests {
         let mut s = snap(Mode::Thinking);
         s.thinking.push(SessionInfo {
             live: LiveText { reasoning: "推导".into(), text: "正文".into(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
         // thinking shows reasoning first
-        let st = live_stream_pinned(&s, Some(Source::Dsh), Mode::Thinking, None).unwrap();
+        let st = live_stream_pinned(&s, Some(Source::Script(0)), Mode::Thinking, None).unwrap();
         assert_eq!(st.kind, 0);
         assert_eq!(st.len, 2);
         assert_eq!(st.session_id, "s1");
@@ -727,9 +733,9 @@ mod tests {
         let mut w = snap(Mode::Working);
         w.working.push(SessionInfo {
             live: LiveText { reasoning: "推导".into(), text: "正文".into(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let st = live_stream_pinned(&w, Some(Source::Dsh), Mode::Working, None).unwrap();
+        let st = live_stream_pinned(&w, Some(Source::Script(0)), Mode::Working, None).unwrap();
         assert_eq!(st.kind, 1);
     }
 
@@ -741,17 +747,17 @@ mod tests {
         s.working.push(SessionInfo {
             tool: Some("bash".into()),
             live: LiveText { reasoning: "推导".into(), text: String::new(), tool_name: None },
-            ..sess("s1", Source::Dsh)
+            ..sess("s1", Source::Script(0))
         });
-        let st = live_stream_pinned(&s, Some(Source::Dsh), Mode::Working, None).unwrap();
+        let st = live_stream_pinned(&s, Some(Source::Script(0)), Mode::Working, None).unwrap();
         assert_eq!(st.kind, 0);
         assert_eq!(st.len, 2);
         // no live content at all -> still None (tool is only a fallback)
         s.working[0].live = LiveText::default();
-        assert!(live_stream_pinned(&s, Some(Source::Dsh), Mode::Working, None).is_none());
+        assert!(live_stream_pinned(&s, Some(Source::Script(0)), Mode::Working, None).is_none());
         // thinking session without any live text yet
         let mut t = snap(Mode::Thinking);
-        t.thinking.push(sess("s1", Source::Dsh));
-        assert!(live_stream_pinned(&t, Some(Source::Dsh), Mode::Thinking, None).is_none());
+        t.thinking.push(sess("s1", Source::Script(0)));
+        assert!(live_stream_pinned(&t, Some(Source::Script(0)), Mode::Thinking, None).is_none());
     }
 }

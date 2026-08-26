@@ -11,8 +11,6 @@ pub mod window;
 use dshpet::anim::{load_animation, load_loop_animation, Animation, Frame, Player};
 use dshpet::bubble_text;
 use dshpet::config::Config;
-use dshpet::connectors::dsh::DshConnector;
-use dshpet::connectors::hermes::HermesConnector;
 use dshpet::connectors::stop_flag;
 use dshpet::state::{Mode, PetState, Snapshot, StateEvent};
 pub mod settings;
@@ -286,18 +284,7 @@ pub fn run() {
 
     let (tx, rx) = channel::<StateEvent>();
     let stop = stop_flag();
-    DshConnector { url: cfg.dsh_url(), poll_ms: cfg.dsh.poll_ms, history_ms: cfg.dsh.history_ms }.spawn(tx.clone(), stop.clone());
-    if let Some(db) = cfg.hermes_db_path() {
-        HermesConnector {
-            db_path: db,
-            poll_ms_active: cfg.hermes.poll_ms_active,
-            poll_ms_idle: cfg.hermes.poll_ms_idle,
-        }
-        .spawn(tx.clone(), stop.clone());
-    } else {
-        eprintln!("hermes db path unresolvable -> hermes disabled");
-    }
-    // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
+    // 全部来源都是 Lua 脚本(DSH/Hermes/MAA/ComfyUI/自定义)
     for (i, sc) in cfg.scripts.iter().enumerate() {
         if !sc.enabled {
             log_line(&format!("[lua] scripts[{i}] disabled in config, skipped"));

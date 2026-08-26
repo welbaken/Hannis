@@ -1,21 +1,15 @@
 //! Config: `config.json` next to the exe, defaults per plan §8.
 //! Path resolution rules are source-verified (see plan §8):
-//! - DSH url: env DSH_PET_URL > config > default http://127.0.0.1:3080
-//! - Hermes db: config > env HERMES_WEB_UI_HOME > %USERPROFILE%\.hermes-web-ui\hermes-web-ui.db
+//! - scripts[].file relative paths are resolved against the exe dir
+//! - DSH url / Hermes db path now live in the DSH/Hermes script args (the
+//!   scripts still honour the DSH_PET_URL / HERMES_WEB_UI_HOME env vars)
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_DSH_URL: &str = "http://127.0.0.1:3080";
-pub const HERMES_RELATIVE_DB: &str = ".hermes-web-ui/hermes-web-ui.db";
-pub const HERMES_HOME_ENV: &str = "HERMES_WEB_UI_HOME";
-pub const DSH_URL_ENV: &str = "DSH_PET_URL";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub dsh: DshConfig,
-    pub hermes: HermesConfig,
     pub auto_hide: AutoHideConfig,
     /// User Lua scripts (open interface, see connectors/lua.rs). Each entry
     /// runs in its own thread with its own embedded Lua state.
@@ -30,26 +24,6 @@ pub struct Config {
     /// Saved window position (pet's last dragged spot). None = default anchor.
     pub window_pos: WindowPosConfig,
     pub autostart: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DshConfig {
-    /// Base url, e.g. http://127.0.0.1:3080
-    pub url: String,
-    pub poll_ms: u64,
-    /// session.history poll interval (ms) - live thinking/output text
-    /// streaming granularity for DSH sessions.
-    pub history_ms: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HermesConfig {
-    /// Explicit db path. null = auto-resolve (env HERMES_WEB_UI_HOME -> user home).
-    pub db_path: Option<String>,
-    pub poll_ms_active: u64,
-    pub poll_ms_idle: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,12 +457,6 @@ impl Default for ScriptEntryConfig {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            dsh: DshConfig { url: DEFAULT_DSH_URL.into(), poll_ms: 2000, history_ms: 1000 },
-            hermes: HermesConfig {
-                db_path: None,
-                poll_ms_active: 1000,
-                poll_ms_idle: 2000,
-            },
             auto_hide: AutoHideConfig::default(),
             scripts: Vec::new(),
             display: DisplayConfig::default(),
@@ -526,25 +494,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Effective DSH url: env DSH_PET_URL > config.url.
-    pub fn dsh_url(&self) -> String {
-        std::env::var(DSH_URL_ENV)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| self.dsh.url.clone())
-    }
-
-    /// Effective Hermes db path, or None if unresolvable.
-    pub fn hermes_db_path(&self) -> Option<PathBuf> {
-        if let Some(p) = &self.hermes.db_path {
-            let p = p.trim();
-            if !p.is_empty() {
-                return Some(PathBuf::from(p));
-            }
-        }
-        resolve_hermes_default_db()
-    }
-
     pub fn opacity_for(&self, mode: &crate::state::Mode) -> f32 {
         match mode {
             crate::state::Mode::Offline => self.opacity.offline,
@@ -586,19 +535,6 @@ pub fn user_home() -> Option<PathBuf> {
     }
 }
 
-/// env HERMES_WEB_UI_HOME > %USERPROFILE% (or $HOME) + ".hermes-web-ui/hermes-web-ui.db"
-pub fn resolve_hermes_default_db() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var(HERMES_HOME_ENV) {
-        let h = h.trim();
-        if !h.is_empty() {
-            return Some(PathBuf::from(h).join("hermes-web-ui.db"));
-        }
-    }
-    let home = user_home()?;
-    // Windows uses forward-slash separators fine on PathBuf.
-    Some(home.join(HERMES_RELATIVE_DB))
-}
-
 impl Config {
     pub fn load(path: &Path) -> Config {
         match std::fs::read_to_string(path) {
@@ -625,7 +561,6 @@ mod tests {
         let c = Config::default();
         let s = serde_json::to_string(&c).unwrap();
         let c2: Config = serde_json::from_str(&s).unwrap();
-        assert_eq!(c2.dsh.url, DEFAULT_DSH_URL);
         assert_eq!(c2.display.scale, 1.0);
         assert_eq!(c2.display.frame_ms, 42);
         assert_eq!(c2.fade.fade_after_sec, 5);
@@ -677,38 +612,6 @@ mod tests {
         assert_eq!(parse_hex_color("red"), None);
         assert_eq!(parse_hex_color("#FFFFF"), None);
         assert_eq!(parse_hex_color("#GGGGGG"), None);
-    }
-
-    #[test]
-    fn dsh_url_env_wins() {
-        let c = Config::default();
-        std::env::set_var(DSH_URL_ENV, "http://127.0.0.1:9999");
-        assert_eq!(c.dsh_url(), "http://127.0.0.1:9999");
-        std::env::remove_var(DSH_URL_ENV);
-        assert_eq!(c.dsh_url(), DEFAULT_DSH_URL);
-    }
-
-    #[test]
-    fn hermes_path_resolution() {
-        // single sequential test: env var wins, then user-profile fallback
-        // (kept serial because parallel tests racing on the same env var is flaky)
-        let c = Config::default();
-        std::env::set_var(HERMES_HOME_ENV, "C:\\custom\\hermes");
-        let p = c.hermes_db_path().unwrap();
-        assert_eq!(p.file_name().unwrap(), "hermes-web-ui.db");
-        assert_eq!(p.parent().unwrap(), Path::new("C:\\custom\\hermes"));
-        std::env::remove_var(HERMES_HOME_ENV);
-        let home = user_home().expect("home present in test env");
-        let p = c.hermes_db_path().unwrap();
-        assert_eq!(p.file_name().unwrap(), "hermes-web-ui.db");
-        assert_eq!(p.parent().unwrap(), home.join(".hermes-web-ui").as_path());
-    }
-
-    #[test]
-    fn explicit_db_path_wins() {
-        let mut c = Config::default();
-        c.hermes.db_path = Some("D:\\data\\hermes.db".into());
-        assert_eq!(c.hermes_db_path().unwrap(), PathBuf::from("D:\\data\\hermes.db"));
     }
 
     #[test]

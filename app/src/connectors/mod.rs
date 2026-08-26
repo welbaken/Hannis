@@ -1,9 +1,10 @@
 //! Connectors: AgentSource implementations (design doc §2/§5/§7).
 //! Each source spawns its own thread(s) and emits StateEvent into a shared
 //! channel. Health flips are emitted as SourceHealth on transitions only.
+//!
+//! DSH / Hermes / MAA / ComfyUI 都已迁移为 Lua 脚本(见 scripts/ 与
+//! scripts-guide.md):本目录只保留脚本宿主(lua.rs)与公共工具。
 
-pub mod dsh;
-pub mod hermes;
 pub mod lua;
 
 use crate::state::StateEvent;

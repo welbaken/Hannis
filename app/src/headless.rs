@@ -1,8 +1,9 @@
-//! Headless driver (non-Windows): runs connectors against live DSH/Hermes and
-//! prints state transitions. Also `--self-test` validates asset decoding.
+//! Headless driver (non-Windows): runs the Lua script connectors against live
+//! DSH/Hermes and prints state transitions. Also `--self-test` validates
+//! asset decoding. All sources (DSH/Hermes/MAA/ComfyUI) are Lua scripts.
 
 use dshpet::config::Config;
-use dshpet::connectors::{dsh::DshConnector, hermes::HermesConnector, stop_flag};
+use dshpet::connectors::stop_flag;
 use dshpet::state::{Mode, PetState, Snapshot, StateEvent};
 use std::path::Path;
 use std::sync::mpsc::channel;
@@ -20,33 +21,17 @@ pub fn run() {
         return;
     }
     let cfg = Config::load(Path::new("config.json"));
-    println!(
-        "config: dsh={} hermes_db={:?} scripts={}",
-        cfg.dsh_url(),
-        cfg.hermes_db_path(),
-        cfg.scripts.len()
-    );
+    println!("config: scripts={} (DSH/Hermes/MAA/ComfyUI 均为 Lua 脚本)", cfg.scripts.len());
     drive(&cfg);
 }
 
 /// Debug mode: print every StateEvent plus per-session state changes, so
 /// streaming issues can be diagnosed live (DSH_PET_DEBUG=1).
 fn debug_run() {
-    use dshpet::state::Source;
     let cfg = Config::load(Path::new("config.json"));
     let (tx, rx) = channel::<StateEvent>();
     let stop: Arc<AtomicBool> = stop_flag();
-    DshConnector { url: cfg.dsh_url(), poll_ms: cfg.dsh.poll_ms, history_ms: cfg.dsh.history_ms }
-        .spawn(tx.clone(), stop.clone());
-    if let Some(db) = cfg.hermes_db_path() {
-        HermesConnector {
-            db_path: db,
-            poll_ms_active: cfg.hermes.poll_ms_active,
-            poll_ms_idle: cfg.hermes.poll_ms_idle,
-        }
-        .spawn(tx.clone(), stop.clone());
-    }
-    // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
+    // 全部来源都是 Lua 脚本(DSH/Hermes/MAA/ComfyUI/自定义)
     for (i, sc) in cfg.scripts.iter().enumerate() {
         if sc.file.trim().is_empty() {
             eprintln!("[lua] scripts[{i}] has empty file, skipped");
@@ -87,9 +72,9 @@ fn debug_run() {
             StateEvent::ToolEnded { session_id, name, .. } => {
                 println!("[debug] ToolEnded {} {}", &session_id[..session_id.len().min(12)], name);
             }
-            StateEvent::Poll { source: Source::Dsh, items, .. } => {
+            StateEvent::Poll { source, items, .. } => {
                 let running: Vec<&str> = items.iter().filter(|i| i.running).map(|i| i.session_id.as_str()).collect();
-                println!("[debug] DSH poll running={} total={}", running.len(), items.len());
+                println!("[debug] {} poll running={} total={}", source.label(), running.len(), items.len());
             }
             _ => {}
         }
@@ -101,18 +86,7 @@ fn drive(cfg: &Config) {
     let (tx, rx) = channel::<StateEvent>();
     let stop: Arc<AtomicBool> = stop_flag();
 
-    DshConnector { url: cfg.dsh_url(), poll_ms: cfg.dsh.poll_ms, history_ms: cfg.dsh.history_ms }.spawn(tx.clone(), stop.clone());
-    if let Some(db) = cfg.hermes_db_path() {
-        HermesConnector {
-            db_path: db,
-            poll_ms_active: cfg.hermes.poll_ms_active,
-            poll_ms_idle: cfg.hermes.poll_ms_idle,
-        }
-        .spawn(tx.clone(), stop.clone());
-    } else {
-        println!("hermes db path unresolvable -> hermes source disabled");
-    }
-    // 用户 Lua 脚本(开放接口):每脚本一线程 + 独立 Lua state
+    // 全部来源都是 Lua 脚本(DSH/Hermes/MAA/ComfyUI/自定义)
     for (i, sc) in cfg.scripts.iter().enumerate() {
         if sc.file.trim().is_empty() {
             eprintln!("[lua] scripts[{i}] has empty file, skipped");
@@ -156,10 +130,8 @@ fn print_snapshot(s: &Snapshot) {
         .filter(|(src, _)| matches!(src, dshpet::state::Source::Script(_)))
         .count();
     println!(
-        "=== MODE {:?} (sources: dsh={} hermes={} scripts={}) ===",
+        "=== MODE {:?} (scripts={}) ===",
         s.mode,
-        s.sources.get(&dshpet::state::Source::Dsh).copied().unwrap_or(false),
-        s.sources.get(&dshpet::state::Source::Hermes).copied().unwrap_or(false),
         scripts,
     );
     if s.queue_len > 0 {

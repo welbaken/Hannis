@@ -318,14 +318,16 @@ pub fn run() {
     let mut y = (sy - h - 80).max(0);
     if let (Some(px), Some(py)) = (cfg.window_pos.x, cfg.window_pos.y) {
         // restore the pet's last dragged spot, clamped to the virtual
-        // screen so a monitor layout change can never park it unreachable
+        // screen so a monitor layout change can never park it unreachable.
+        // 与拖拽同一规则:按本体(设计宽 800×scale,让位偏移按系统 DPI)
+        // 钳制横向,窗口留白允许悬出屏外——否则本体右缘到不了屏幕右缘。
         unsafe {
-            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let (lo, hi) = (vx, vx + vw - w);
-            x = px.clamp(lo.min(hi), lo.max(hi));
+            let dpi = GetDpiForSystem().max(96) as f32 / 96.0;
+            let pet_w = (800.0 * scale) as u32;
+            let (lo, hi) = pet_drag_x_bounds(pet_w, bubble_overhang_px(pet_w, dpi));
+            x = px.clamp(lo, hi);
             let (lo, hi) = (vy, vy + vh - h);
             y = py.clamp(lo.min(hi), lo.max(hi));
         }
@@ -449,6 +451,33 @@ fn move_toward(cur: (i32, i32), goal: (i32, i32), speed: f32, dt_ms: u64) -> ((i
         let ny = (cur.1 as f32 + dy / dist * step).round() as i32;
         ((nx, ny), false)
     }
+}
+
+/// 气泡左缘相对本体左缘的偏移(物理 px):右缘锚定在 动图宽×DPI 的
+/// BUBBLE_RIGHT_FRACTION(= 设计宽×DPI 的 25%)。动图宽必须乘 DPI:
+/// 帧按 display.scale 缩放(不含 DPI),气泡宽按 DPI 缩放,两者混算会把
+/// 比例锚点拉离原位——scale=1.0 时右缘必须恒为 200×DPI,否则 DPI>100%
+/// 下气泡会明显偏左。
+fn bubble_left_rel(pet_w: u32, dpi: f32) -> f32 {
+    (pet_w as f32) * dpi * bubble::BUBBLE_RIGHT_FRACTION
+        - bubble::scaled(bubble::MAX_BUBBLE_W, dpi) as f32
+}
+
+/// 气泡左缘越过本体左缘时本体需向右让位的距离(px):`pet_offset_x` 与
+/// 启动恢复(`run`)共用同一公式。
+fn bubble_overhang_px(pet_w: u32, dpi: f32) -> i32 {
+    (-bubble_left_rel(pet_w, dpi)).max(0.0).round() as i32
+}
+
+/// 本体拖拽/恢复的横向边界(物理 px):本体(窗口 x + 让位偏移)完整留在
+/// 虚拟屏内,窗口的左右留白(EXTRA 与让位)允许悬出屏幕——把整个窗口
+/// 钳在屏内会让本体右缘止步于距屏右缘 EXTRA_W 处,拖不到边。
+fn pet_drag_x_bounds(pet_w: u32, overhang: i32) -> (i32, i32) {
+    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let lo = vx - overhang;
+    let hi = vx + vw - pet_w as i32 - overhang;
+    (lo.min(hi), lo.max(hi))
 }
 
 impl App {
@@ -748,9 +777,13 @@ impl App {
                 self.bubble_stale_since = Some(tick_now);
                 self.bubble_text = text;
                 self.dirty_request = true;
-                let pet_w = self.pet_size().0;
-                let pet_h = self.pet_size().1;
-                self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp);
+            }
+            // 每帧按当前 pet 尺寸重排:宠物缩小后旧的大气泡会把下段顶出
+            // 窗口底部被截断;layout 在文本与几何都未变时直接返回(零开销)
+            let pet_w = self.pet_size().0;
+            let pet_h = self.pet_size().1;
+            if self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp) {
+                self.dirty_request = true;
             }
         } else {
             self.reveal = None;
@@ -760,9 +793,11 @@ impl App {
             if text != self.bubble_text {
                 self.bubble_text = text;
                 self.dirty_request = true;
-                let pet_w = self.pet_size().0;
-                let pet_h = self.pet_size().1;
-                self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp);
+            }
+            let pet_w = self.pet_size().0;
+            let pet_h = self.pet_size().1;
+            if self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp) {
+                self.dirty_request = true;
             }
         }
 
@@ -1012,7 +1047,7 @@ impl App {
         if !active {
             if let Some(home) = self.avoid_home {
                 self.avoid_offscreen = false;
-                let (goal_x, goal_y) = self.clamp_inside_screen(home.0, home.1, w, h);
+                let (goal_x, goal_y) = self.clamp_inside_screen(home.0, home.1, h);
                 let ((nx, ny), done) = move_toward((x, y), (goal_x, goal_y), avoid.return_speed, dt);
                 if done {
                     self.avoid_home = None;
@@ -1068,14 +1103,14 @@ impl App {
             }
             let goal_x = home.0 as f32 + vx * avoid.shift;
             let goal_y = home.1 as f32 + vy * avoid.shift;
-            let (goal_x, goal_y) = self.clamp_inside_screen(goal_x as i32, goal_y as i32, w, h);
+            let (goal_x, goal_y) = self.clamp_inside_screen(goal_x as i32, goal_y as i32, h);
             let ((nx, ny), _) = move_toward((x, y), (goal_x, goal_y), avoid.dodge_speed, dt);
             if nx != x || ny != y {
                 window::set_window_rect(self.hwnd, nx, ny, w, h);
             }
         } else if let Some(home) = self.avoid_home {
             // Returning: glide back to the recorded home at return speed.
-            let (goal_x, goal_y) = self.clamp_inside_screen(home.0, home.1, w, h);
+            let (goal_x, goal_y) = self.clamp_inside_screen(home.0, home.1, h);
             let ((nx, ny), done) = move_toward((x, y), (goal_x, goal_y), avoid.return_speed, dt);
             if done {
                 self.avoid_home = None;
@@ -1257,15 +1292,11 @@ impl App {
         });
     }
 
-    /// 气泡在左侧让出的空间(px):气泡右缘按动图宽度的固定百分比
+    /// 气泡在左侧让出的空间(px):气泡右缘按 动图宽×DPI 的固定百分比
     /// (bubble::BUBBLE_RIGHT_FRACTION)定位;当气泡左缘越过本体左缘时,
     /// 本体向右偏移该距离、窗口相应向左加宽,本体屏幕位置保持不变。
     fn pet_offset_x(&self) -> i32 {
-        let (pet_w, _) = self.pet_size();
-        let dpi = self.comp.dpi_scale();
-        let bubble_w = bubble::scaled(bubble::MAX_BUBBLE_W, dpi) as f32;
-        let bx_rel = (pet_w as f32) * bubble::BUBBLE_RIGHT_FRACTION - bubble_w;
-        (-bx_rel).max(0.0).round() as i32
+        bubble_overhang_px(self.pet_size().0, self.comp.dpi_scale())
     }
 
     /// Non-transparent pet rect in window-local coords (x_off, y_off, w, h).
@@ -1282,14 +1313,14 @@ impl App {
 
     /// Keep a window position on the virtual screen so a dodge/return can
     /// never park the pet somewhere unreachable (same clamp as dragging).
-    fn clamp_inside_screen(&self, x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    /// Horizontal bounds follow the pet's visible box (pet_drag_x_bounds),
+    /// letting the window's gutters overhang the screen edge.
+    fn clamp_inside_screen(&self, x: i32, y: i32, h: i32) -> (i32, i32) {
         unsafe {
-            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            let (lo, hi) = (vx, vx + vw - w);
-            let nx = x.clamp(lo.min(hi), lo.max(hi));
+            let (lo, hi) = pet_drag_x_bounds(self.pet_size().0, self.pet_offset_x());
+            let nx = x.clamp(lo, hi);
             let (lo, hi) = (vy, vy + vh - h);
             let ny = y.clamp(lo.min(hi), lo.max(hi));
             (nx, ny)
@@ -1322,9 +1353,8 @@ impl App {
         // right sliver" look holds at every display scale; without the left
         // gutter a small pet would sit fully on top of the bubble.
         let dpi = self.comp.dpi_scale();
-        let bubble_w = bubble::scaled(bubble::MAX_BUBBLE_W, dpi) as f32;
-        // 气泡左缘(相对本体):右缘 = 动图宽 × 百分比,减掉气泡宽。
-        let bx_rel = (pet_w as f32) * bubble::BUBBLE_RIGHT_FRACTION - bubble_w;
+        // 气泡左缘(相对本体):右缘 = 动图宽×DPI × 百分比,减掉气泡宽。
+        let bx_rel = bubble_left_rel(pet_w, dpi);
         let overhang = (-bx_rel).max(0.0).round() as u32;
         let pet_x = overhang as i32;
         let win_w = pet_w + WINDOW_EXTRA_W + overhang;
@@ -1456,7 +1486,7 @@ impl App {
             // pet somewhere unreachable; a windowless stale instance would
             // then block all relaunches). Keep at least a sliver visible so
             // the pet can always be grabbed again.
-            let (nx, ny) = self.clamp_inside_screen(nx0, ny0, w, h);
+            let (nx, ny) = self.clamp_inside_screen(nx0, ny0, h);
             window::set_window_rect(self.hwnd, nx, ny, w, h);
         }
     }
@@ -1479,26 +1509,6 @@ impl App {
                 let _ = ReleaseCapture();
             }
         }
-    }
-
-    pub fn on_zoom(&mut self, wheel_delta: i32) {
-        let steps = (wheel_delta / 120) as f32;
-        let mut s = self.cfg.display.scale + steps * 0.05;
-        s = s.clamp(0.25, 2.0);
-        if (s - self.cfg.display.scale).abs() < 1e-4 {
-            return;
-        }
-        self.cfg.display.scale = s;
-        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
-        self.dirty_request = true;
-        // resizing re-anchors the window bottom-right, invalidating any
-        // remembered avoid home; the next dodge re-records it
-        self.avoid_offscreen = false;
-        self.avoid_home = None;
-        // reload at the new scale; keep the old frames on screen meanwhile
-        let asset = if self.mode == Mode::Offline { "idle" } else { self.mode.asset() };
-        self.pending = Some(self.mode);
-        self.spawn_load(asset);
     }
 
     pub fn show_tray_menu(&mut self) {

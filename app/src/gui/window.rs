@@ -1,12 +1,11 @@
 //! Layered always-on-top window (WS_EX_LAYERED|TOPMOST|TOOLWINDOW) and its
-//! message handling: drag (move state), Ctrl+wheel zoom, tray callback.
+//! message handling: drag (move state) and tray callback.
 
 use super::App;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_APP_TRAY: u32 = WM_APP + 10;
@@ -56,14 +55,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEWHEEL => {
             // always consume the wheel over the pet so it never reaches the
-            // app below; Ctrl+wheel adjusts the pet size
-            let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
-            let ctrl = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16) & 0x8000 != 0 };
-            if ctrl {
-                with_app(|a| {
-                    a.on_zoom(delta);
-                });
-            }
+            // app below (Ctrl+wheel 缩放已移除:每次步进都要重解码整张
+            // 8000×8000 sheet,无法实时响应)
             LRESULT(0)
         }
         WM_MOUSEHWHEEL => LRESULT(0),

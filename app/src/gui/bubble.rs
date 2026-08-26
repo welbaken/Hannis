@@ -17,18 +17,17 @@ use dshpet::state::Mode;
 pub const PAD_X: u32 = 7;
 pub const PAD_TOP: u32 = 6;
 pub const PAD_BOTTOM: u32 = 8;
-/// Window-relative margin of the bubble from the window's top-left corner.
+/// Window-relative margin of the bubble from the window's top edge.
 /// Kept ≥ the shadow blur so the halo diffuses evenly from the card's
 /// center without being clipped by the window edge.
-pub const BUBBLE_MARGIN_X: u32 = 44;
 pub const BUBBLE_MARGIN_Y: u32 = 44;
 /// 气泡右缘在动图中的设计锚点:display.scale = 1.0、dpi = 1.0 时右缘位于
-/// BUBBLE_MARGIN_X + MAX_BUBBLE_W = 194px,即 800px 动图宽的 24.25%。
-/// 缩放比例变化时气泡右缘始终按该百分比定位(gui::compose),保证
-/// "本体只遮挡气泡右缘一小截"的遮挡关系不随 scale 改变——否则缩小后
-/// 气泡会横在本体下方,看起来像本体站到了气泡正上方。
-pub const BUBBLE_RIGHT_FRACTION: f32 =
-    (BUBBLE_MARGIN_X as f32 + MAX_BUBBLE_W as f32) / 800.0;
+/// 800px 动图宽的 25% = 200px。缩放比例变化时气泡右缘始终按该百分比定位
+/// (gui::compose),保证"本体只遮挡气泡右缘一小截"的遮挡关系不随 scale
+/// 改变——否则缩小后气泡会横在本体下方,看起来像本体站到了气泡正上方。
+/// 定位公式在物理空间计算:动图宽(仅按 display.scale 缩放)需再乘 DPI,
+/// 与按 DPI 缩放的气泡宽同空间。
+pub const BUBBLE_RIGHT_FRACTION: f32 = 0.25;
 /// Phone-screen proportions, enlarged 1.5×: a wider/taller portrait panel.
 /// It may extend under the pet body, which is fine (部分遮挡).
 ///pub const MAX_BUBBLE_W: u32 = 178;
@@ -110,21 +109,7 @@ impl Bubble {
     /// trailing lines dropped with "…", and a streaming single line is
     /// tail-fitted: newest chars kept, oldest dropped with a leading "…").
     pub fn layout(&mut self, text: BubbleText, pet_w: u32, pet_h: u32, comp: &Compositor) -> bool {
-        if text == self.text {
-            return false;
-        }
-        if text.title.is_empty() {
-            self.text = text;
-            self.w = 0;
-            self.h = 0;
-            self.header_h = 0;
-            self.from_h = 0;
-            return true;
-        }
         let s = comp.dpi_scale();
-        let pad_x = scaled(PAD_X, s);
-        let pad_top = scaled(PAD_TOP, s);
-        let pad_bottom = scaled(PAD_BOTTOM, s);
         // fixed size regardless of the message
         let min_w = scaled(MIN_BUBBLE_W, s);
         let w = scaled(MAX_BUBBLE_W, s).min(pet_w.max(min_w));
@@ -134,6 +119,23 @@ impl Bubble {
         // 导致气泡下缘 394×DPI 超过动图高 800×scale 而被截断
         // (150% DPI 时 scale ≤ 0.74 即触发,下缘被切掉 (394×1.5−800×s)px)。
         let h = scaled(MAX_BUBBLE_H, s).min(pet_h.saturating_sub(scaled(BUBBLE_MARGIN_Y, s)));
+        // 文本与几何都未变才跳过:几何(宠物缩放 / DPI)变化时旧的大气泡
+        // 会把下段顶出窗口底部被截断,必须重排内容(重新按新预算截行)。
+        if text == self.text && w == self.w && h == self.h {
+            return false;
+        }
+        if text.title.is_empty() {
+            let changed = !self.text.title.is_empty() || self.w != 0 || self.h != 0;
+            self.text = text;
+            self.w = 0;
+            self.h = 0;
+            self.header_h = 0;
+            self.from_h = 0;
+            return changed;
+        }
+        let pad_x = scaled(PAD_X, s);
+        let pad_top = scaled(PAD_TOP, s);
+        let pad_bottom = scaled(PAD_BOTTOM, s);
         let text_w = w.saturating_sub(pad_x * 2).max(scaled(72, s));
         let text_h = h.saturating_sub(pad_top + pad_bottom).max(scaled(24, s));
 

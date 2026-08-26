@@ -127,6 +127,9 @@ const WINDOW_EXTRA_W: u32 = 180;
 /// (and the pet) shifts visibly to the right of where a bottom-right
 /// 80-px anchor would place it.
 const RIGHT_MARGIN: i32 = 10;
+/// 拖拽/恢复/回避归位的可见底线(px):本体大部分可以拖出屏幕,但至少保留
+/// 这么多像素可见——保证总能再抓回来(完全离屏会丢窗口,残留实例还会挡住重启)。
+const DRAG_SLIVER_PX: i32 = 48;
 
 #[derive(Default)]
 pub(crate) struct LoadSlot {
@@ -306,16 +309,14 @@ pub fn run() {
     if let (Some(px), Some(py)) = (cfg.window_pos.x, cfg.window_pos.y) {
         // restore the pet's last dragged spot, clamped to the virtual
         // screen so a monitor layout change can never park it unreachable.
-        // 与拖拽同一规则:按本体(设计宽 800×scale,让位偏移按系统 DPI)
-        // 钳制横向,窗口留白允许悬出屏外——否则本体右缘到不了屏幕右缘。
+        // 与拖拽同一规则:本体大部分可拖出屏外(至少保留 DRAG_SLIVER_PX 可见),
+        // 所以上次拖到边缘外(如 80% 出屏)的位置重启后也原样恢复。
         unsafe {
-            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let dpi = GetDpiForSystem().max(96) as f32 / 96.0;
             let pet_w = (800.0 * scale) as u32;
             let (lo, hi) = pet_drag_x_bounds(pet_w, bubble_overhang_px(pet_w, dpi));
             x = px.clamp(lo, hi);
-            let (lo, hi) = (vy, vy + vh - h);
+            let (lo, hi) = pet_drag_y_bounds(h);
             y = py.clamp(lo.min(hi), lo.max(hi));
         }
         log_line(&format!("[gui] restore window pos ({x}, {y})"));
@@ -456,15 +457,26 @@ fn bubble_overhang_px(pet_w: u32, dpi: f32) -> i32 {
     (-bubble_left_rel(pet_w, dpi)).max(0.0).round() as i32
 }
 
-/// 本体拖拽/恢复的横向边界(物理 px):本体(窗口 x + 让位偏移)完整留在
-/// 虚拟屏内,窗口的左右留白(EXTRA 与让位)允许悬出屏幕——把整个窗口
-/// 钳在屏内会让本体右缘止步于距屏右缘 EXTRA_W 处,拖不到边。
+/// 本体拖拽/恢复的横向边界(物理 px):本体(窗口 x + 让位偏移)大部分可拖出
+/// 虚拟屏,但至少保留 `DRAG_SLIVER_PX` 可见(窗口的左右留白 EXTRA 与让位
+/// 允许悬出屏外)。原先把本体完整钳在屏内,用户没法把宠物拖到屏幕边缘外。
 fn pet_drag_x_bounds(pet_w: u32, overhang: i32) -> (i32, i32) {
     let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let lo = vx - overhang;
-    let hi = vx + vw - pet_w as i32 - overhang;
+    let s = DRAG_SLIVER_PX;
+    let lo = vx + s - overhang - pet_w as i32;
+    let hi = vx + vw - s - overhang;
     (lo.min(hi), lo.max(hi))
+}
+
+/// 纵向边界(物理 px):窗口至少保留 `DRAG_SLIVER_PX` 在虚拟屏内(其余可拖出)。
+fn pet_drag_y_bounds(h: i32) -> (i32, i32) {
+    unsafe {
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let s = DRAG_SLIVER_PX;
+        (vy + s - h, vy + vh - s)
+    }
 }
 
 impl App {
@@ -1298,17 +1310,15 @@ impl App {
         }
     }
 
-    /// Keep a window position on the virtual screen so a dodge/return can
-    /// never park the pet somewhere unreachable (same clamp as dragging).
-    /// Horizontal bounds follow the pet's visible box (pet_drag_x_bounds),
-    /// letting the window's gutters overhang the screen edge.
+    /// Keep a window position reachable on the virtual screen so a dodge/
+    /// return can never park the pet somewhere unreachable (same clamp as
+    /// dragging). 本体大部分可拖出屏外,只要求至少保留 DRAG_SLIVER_PX 可见;
+    /// 横向按本体的可见盒(pet_drag_x_bounds),窗口留白允许悬出屏外。
     fn clamp_inside_screen(&self, x: i32, y: i32, h: i32) -> (i32, i32) {
         unsafe {
-            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let (lo, hi) = pet_drag_x_bounds(self.pet_size().0, self.pet_offset_x());
             let nx = x.clamp(lo, hi);
-            let (lo, hi) = (vy, vy + vh - h);
+            let (lo, hi) = pet_drag_y_bounds(h);
             let ny = y.clamp(lo.min(hi), lo.max(hi));
             (nx, ny)
         }
@@ -1468,11 +1478,9 @@ impl App {
             let nx0 = self.drag_win.0 + (cx - self.drag_cursor.0);
             let ny0 = self.drag_win.1 + (cy - self.drag_cursor.1);
             let (_, _, w, h) = self.window_size();
-            // Never let a drag lose the window off the virtual screen (a
-            // coordinate leap / edge drag / multi-monitor quirk can park the
-            // pet somewhere unreachable; a windowless stale instance would
-            // then block all relaunches). Keep at least a sliver visible so
-            // the pet can always be grabbed again.
+            // 允许把宠物大部分拖出屏幕,但保留 DRAG_SLIVER_PX 可见的安全底线
+            // (坐标跳变/多显示器切换也不会让窗口完全离屏——完全离屏会丢
+            // 窗口且残留实例会挡住重启;留一条边就能随时再抓回来)。
             let (nx, ny) = self.clamp_inside_screen(nx0, ny0, h);
             window::set_window_rect(self.hwnd, nx, ny, w, h);
         }

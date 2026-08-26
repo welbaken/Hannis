@@ -439,6 +439,9 @@ pub struct ScriptEntryConfig {
     pub sandbox: bool,
     /// false = 不启动该接入口(托盘"接入口"子菜单可切换,写回 config.json)。
     pub enabled: bool,
+    /// true = 把该脚本每条 `pet.*` 调用(事件名+关键字段)和启动时的 args
+    /// 写进 hannis.log,便于排查"调用发出去了没/发成什么样"。默认 false。
+    pub debug: bool,
 }
 
 impl Default for ScriptEntryConfig {
@@ -450,6 +453,7 @@ impl Default for ScriptEntryConfig {
             args: None,
             sandbox: false,
             enabled: true,
+            debug: false,
         }
     }
 }
@@ -470,6 +474,7 @@ fn default_scripts() -> Vec<ScriptEntryConfig> {
             })),
             sandbox: false,
             enabled: true,
+            debug: false,
         },
         ScriptEntryConfig {
             name: "Hermes".into(),
@@ -482,6 +487,7 @@ fn default_scripts() -> Vec<ScriptEntryConfig> {
             })),
             sandbox: false,
             enabled: true,
+            debug: false,
         },
     ]
 }
@@ -715,6 +721,10 @@ mod tests {
         ).unwrap();
         assert_eq!(c3.scripts[0].poll_ms, 500);
         assert!(c3.scripts[0].sandbox);
+        assert!(!c3.scripts[0].debug, "debug 默认关");
         assert_eq!(c3.scripts[0].args.as_ref().unwrap()["log"], "x");
+        // debug 字段可解析
+        let c4: Config = serde_json::from_str(r#"{"scripts":[{"name":"D","file":"d.lua","debug":true}]}"#).unwrap();
+        assert!(c4.scripts[0].debug);
     }
 }

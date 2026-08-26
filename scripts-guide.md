@@ -22,6 +22,7 @@
     "poll_ms": 1000,               // 提示值,脚本可用 pet.config().poll_ms 读取
     "sandbox": false,              // true = 禁用文件/进程/网络访问(只保留纯计算 + pet API)
     "enabled": true,               // false = 不启动(托盘/设置面板可切换)
+    "debug": false,                // true = 把每条 pet.* 调用写进 hannis.log(排查用)
     "args": { "log": "D:\\MyGame\\game.log" }  // 任意 JSON,脚本通过 pet.config().args 读取
   }
 ]
@@ -133,6 +134,11 @@ end
 
 - `pet.log(level, msg)` → 追加到 exe 同目录 `hannis.log`
 - 脚本编译/运行错误也会写进 `hannis.log`(形如 `[lua:名字] script error: …`)
+- **脚本启动时会回显 args**(`[lua:名字] started (N bytes) args={...}`)——配置传错
+  (url 拼错、路径不对)一眼可见
+- **`"debug": true` 时把每条 `pet.*` 调用写进日志**:`[lua:名字] ev: session_started
+  script-0-xxx turn=1` / `tool_started …` / `live_text … r+3 t+2` / `poll N items` /
+  `health true`…——确认"调用发出去了没/发成什么样",定位宠物卡状态最有效
 - WSL 下开发:headless 模式直接跑,错误在 stderr 可见:
   `cd app && cargo run`(读取 config.json 的 scripts 并执行)
 - 脚本一改就重启 Hannis 生效(暂无热重载)

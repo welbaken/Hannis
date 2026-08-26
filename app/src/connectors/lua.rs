@@ -16,7 +16,7 @@
 //! loadfile/load/debug are removed from the globals — the script can only
 //! compute and call the pet API (no filesystem/process/network access).
 
-use super::{send, sleep_interruptible};
+use super::sleep_interruptible;
 use crate::config::ScriptEntryConfig;
 use crate::state::{register_script_label, SessionItem, Source, StateEvent, TodoItem, TurnEndReason};
 use mlua::{Lua, Table, Value};
@@ -24,6 +24,74 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+
+/// 脚本事件发送包装:`debug: true` 时把每条 `pet.*` 调用(事件名+关键字段)
+/// 写进日志,便于脚本作者确认"调用发出去了没/发成什么样"(排查宠物卡状态)。
+/// debug 关闭时零开销(不格式化、不发日志)。
+struct EvSender {
+    tx: Sender<StateEvent>,
+    debug: bool,
+    log: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+impl Clone for EvSender {
+    fn clone(&self) -> Self {
+        EvSender { tx: self.tx.clone(), debug: self.debug, log: self.log.clone() }
+    }
+}
+
+fn send(ev_tx: &EvSender, ev: StateEvent) {
+    if ev_tx.debug {
+        (ev_tx.log)(format!("ev: {}", ev_summary(&ev)));
+    }
+    let _ = ev_tx.tx.send(ev);
+}
+
+/// 事件的一行摘要(debug 轨迹用)。
+fn ev_summary(ev: &StateEvent) -> String {
+    match ev {
+        StateEvent::SourceHealth { healthy, .. } => format!("health {healthy}"),
+        StateEvent::Poll { items, .. } => format!("poll {} items", items.len()),
+        StateEvent::SessionStatus { session_id, running, .. } => {
+            format!("session_status {} {}", session_id, running)
+        }
+        StateEvent::TurnStarted { session_id, turn, .. } => {
+            format!("session_started {} turn={}", session_id, turn)
+        }
+        StateEvent::TurnEnded { session_id, turn, reason, .. } => {
+            format!("session_ended {} turn={} {:?}", session_id, turn, reason)
+        }
+        StateEvent::ToolStarted { session_id, name, .. } => {
+            format!("tool_started {} {}", session_id, name)
+        }
+        StateEvent::ToolEnded { session_id, name, error, .. } => {
+            format!("tool_ended {} {} err={}", session_id, name, error)
+        }
+        StateEvent::TodoSnapshot { session_id, todos, .. } => {
+            format!("todo {} n={}", session_id, todos.len())
+        }
+        StateEvent::ApprovalRequested { id, session_id, tool, .. } => {
+            format!("approval_requested {} {} {}", id, session_id, tool)
+        }
+        StateEvent::ApprovalResolved { id, .. } => format!("approval_resolved {}", id),
+        StateEvent::QuestionRequested { id, session_id, .. } => {
+            format!("question {} {}", id, session_id)
+        }
+        StateEvent::QuestionResolved { id, .. } => format!("answer {}", id),
+        StateEvent::PendingSync { .. } => "pending_sync".to_string(),
+        StateEvent::LiveText { session_id, reasoning, text, .. } => format!(
+            "live_text {} r+{} t+{}",
+            session_id,
+            reasoning.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+            text.as_ref().map(|s| s.chars().count()).unwrap_or(0),
+        ),
+        StateEvent::UserMessage { session_id, text, .. } => {
+            format!("user_message {} {} chars", session_id, text.chars().count())
+        }
+        StateEvent::QueueChanged { pending, .. } => format!("queue {}", pending),
+        StateEvent::Tick => "tick".to_string(),
+    }
+}
 
 pub struct LuaScriptConnector {
     /// Script source id (= registration index in the `scripts` array).
@@ -54,7 +122,7 @@ impl LuaScriptConnector {
 
     fn fail(&self, tx: &Sender<StateEvent>, msg: &str) {
         self.log(msg);
-        send(tx, StateEvent::SourceHealth { source: Source::Script(self.id), healthy: false });
+        super::send(tx, StateEvent::SourceHealth { source: Source::Script(self.id), healthy: false });
     }
 
     /// Load + run the script (synchronous; also used by tests). The script is
@@ -77,8 +145,16 @@ impl LuaScriptConnector {
             Ok(f) => f,
             Err(e) => return self.fail(&tx, &format!("script compile failed: {e}")),
         };
-        send(&tx, StateEvent::SourceHealth { source: Source::Script(self.id), healthy: true });
-        self.log(&format!("started ({} bytes)", src.len()));
+        super::send(&tx, StateEvent::SourceHealth { source: Source::Script(self.id), healthy: true });
+        // 启动即回显 args(配置传错一眼可见);debug 模式再展开每条事件
+        let args_s = self
+            .entry
+            .args
+            .as_ref()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let args_s: String = args_s.chars().take(300).collect();
+        self.log(&format!("started ({} bytes) args={}", src.len(), args_s));
         match func.call::<()>(()) {
             Ok(()) => self.fail(&tx, "script returned (not looping) — source stopped"),
             Err(e) => self.fail(&tx, &format!("script error: {e}")),
@@ -150,6 +226,25 @@ impl LuaScriptConnector {
             let prefix = prefix.clone();
             move |s: String| format!("{prefix}{s}")
         };
+        // 事件调试日志:debug=true 时每条 pet.* 调用写一行(不经 30s 去重,
+        // 需要完整轨迹);关闭时零成本。所有 send 走 EvSender 统一出口。
+        let ev_log: Arc<dyn Fn(String) + Send + Sync> = {
+            let name = name.clone();
+            let log_path = log_path.clone();
+            let on = self.entry.debug;
+            Arc::new(move |msg: String| {
+                if on {
+                    eprintln!("[lua:{name}] {msg}");
+                    if let Some(p) = &log_path {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[lua:{name}] {msg}");
+                        }
+                    }
+                }
+            })
+        };
+        let tx = EvSender { tx, debug: self.entry.debug, log: ev_log };
 
         let pet = lua.create_table()?;
 

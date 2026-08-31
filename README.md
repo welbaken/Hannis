@@ -41,13 +41,14 @@ dist/
 - **气泡**:现代卡片风格——1px 浅灰微边框 + **向四周弥散的柔和阴影**(CSS `box-shadow: 0 20px 40px rgba(0,0,0,.15)` 风格,软件高斯模糊) + 半透明白底。内容分三层:标题行(状态名居左,如「思考中…」;**"From DSH/Hermes" 客户端名右对齐**)、1px 分割线、分割线下的信息流。思考时**滚动显示思考文字流(显示最新内容尾部)**,工作时显示**正在执行的工具+实际内容**(DSH 为工具参数;Hermes 为工具结果输出,该版本无参数列);**双方都休息或全部断线时不显示气泡**
 - **MAA / ComfyUI 内置源已脚本化**:MAA 与 ComfyUI 不再由内置 Rust 连接器提供,改为随程序发布的 Lua 脚本(行为与原内置版一致):
   - `scripts/maa.lua` — 监控 MAA `debug/gui.log`,由 `args.log` 指定路径;`args.attention_ms` 控制资深干员 attention 保持时长(默认 3000ms);`args.stream=true`(默认)时**任务期间的用户可见日志行**([TaskQueueViewModel],如「理智作战」的 开始行动/掉落统计、公招识别结果 等)会组装成信息流显示在气泡里,直到下一次 done/fail/attention。行为:正在连接模拟器=thinking、开始任务=working、任务链完成(`Idle: false to true (called from ProcTaskChainMsg)`)=done(整条链一次,链内「完成任务」行不单独触发)、已停止=fail、…资深干员…=attention(约 `attention_ms` 后自动消除);日志清空/截断=运行边界;启动时恢复 30 分钟内的未完成链
-  - `scripts/comfyui.lua` — 轮询 ComfyUI `/queue` + `/history`(经 `pet.http`,无需外部工具),有任务在跑=working、成功=done、出错=fail、队列深度进气泡;服务不可达=该源不健康
+  - `scripts/comfyui.lua` — 轮询 ComfyUI `/queue` + `/history`(经 `pet.http`,无需外部工具),有任务在跑=working、成功=done、出错=fail、队列深度进气泡;服务持续不可达(约 10s)时把进行中的任务按 aborted 中性收尾(不误报 done),该源标记不健康
   - `scripts/dsh.lua` / `scripts/hermes.lua` — DSH 与 Hermes 连接器同样由内置 Rust 迁移为脚本(行为与原内置版一致,线格式见 `scripts-guide.md` §9)
   - 四者都由 config.json `scripts` 数组注册(默认配置已含),与其它脚本一样会写 `hannis.log` 便于排查
-- **窗口**:Ctrl+滚轮缩放(0.25–2.0),拖拽移动;托盘右键可切换「回避模式」「自动收起」与「退出」(其余配置走 config.json)
+- **窗口**:Ctrl+滚轮缩放(0.25–2.0),拖拽移动;托盘右键可切换「回避模式」「自动收起」「开机自启」与「退出」(其余配置走 config.json)
 - **Lua 脚本接入(开放接口)**:在 config.json 的 `scripts` 数组注册任意 `.lua` 脚本即可把**任何程序**接入宠物——内嵌 Lua 5.4 已静态链接进 exe,用户只需会写 Lua、**无需安装任何运行时**。脚本在自己线程里轮询,通过 `pet.*` API 驱动状态机(与内置连接器同一套事件契约):`session_started/ended`、`session_status`、`tool_started/ended`、`live_text`、`question/answer`、`approval_requested/resolved`、`pending_sync`、`poll`、`todo`、`queue`、`health`、`log`、`wait`、`config`、`http/http_post/ws/sqlite`。脚本编译/运行出错只下线该脚本源,不影响宠物;`"sandbox": true` 可禁用文件/进程/网络访问。详见 `scripts-guide.md`(含 DSH/Hermes 线格式参考),示例:`scripts/tail_log.lua`(通用日志监控,关键词自定义)与 `scripts/process_watch.lua`(进程监控)
-- **自动收起(auto-hide)**:托盘勾选「自动收起」后,idle/offline 持续超过 `auto_hide.after_sec`(默认 30 秒),宠物从原位**向下滑动**到任务栏区域(`slide_speed` px/s,默认 600,y = 屏幕高度 − `y_factor` × 窗口高度,默认 0.4)。**保持置顶**——头仍悬浮在所有窗口之上,被任务栏盖住的身体部分裁剪为透明(任务栏从透明区透出,看起来就是"身体被任务栏挡住");透明度在渐隐基础上再乘 `opacity`(默认 0.3);**鼠标点击穿透**(WS_EX_TRANSPARENT,可正常操作其下方的任务栏/桌面)。退出条件:有新消息(状态离开 idle/offline)或鼠标悬停超过 `hover_sec`(默认 3 秒,可设置)——**滑回原位**、恢复不透明度与完整绘制。纯窗口样式+位置实现,无额外权限/依赖
+- **自动收起(auto-hide)**:默认开启;托盘勾选「自动收起」后,idle/offline 持续超过 `auto_hide.after_sec`(默认 30 秒),宠物从原位**向下滑动**到任务栏区域(`slide_speed` px/s,默认 600,y = 屏幕高度 − `y_factor` × 窗口高度,默认 0.4)。**保持置顶**——头仍悬浮在所有窗口之上,被任务栏盖住的身体部分裁剪为透明(任务栏从透明区透出,看起来就是"身体被任务栏挡住");透明度在渐隐基础上再乘 `opacity`(默认 0.3);**鼠标点击穿透**(WS_EX_TRANSPARENT,可正常操作其下方的任务栏/桌面)。退出条件:有新消息(状态离开 idle/offline)或鼠标悬停超过 `hover_sec`(默认 3 秒,可设置)——**滑回原位**、恢复不透明度与完整绘制。纯窗口样式+位置实现,无额外权限/依赖
 - **滚轮拦截**:宠物上的滚轮事件一律被吞掉,不会透传给下层应用(Ctrl+滚轮=缩放宠物)
+- **鼠标穿透(click-through)**:托盘右键「鼠标穿透」开启后,窗口加 WS_EX_TRANSPARENT——点击/滚轮全部落到下层界面,宠物不再拦截任何鼠标操作;光标悬浮在宠物上时整体压暗到 `click_through.hover_opacity`(默认 0.1,即透视 90% 看到下层),移开恢复。默认关(开箱可正常点击),状态写回 config.json
 - **回避模式(avoid)**:开启后宠物会自动躲开鼠标——光标靠近到 `avoid.distance` 范围内时,宠物快速跳开到 `avoid.shift` 像素外并保持;光标移出 `distance × hysteresis` 范围后,宠物平滑滑回原位。可在托盘右键勾选/取消,即时生效并写回 config.json
 - **单实例**:重复启动会直接退出
 
@@ -95,13 +96,13 @@ dist/
       "name": "ComfyUI",                        // 气泡 "From ComfyUI"
       "file": "scripts/comfyui.lua",            // 轮询出图队列(经 pet.http)
       "poll_ms": 2000,
-      "args": { "url": "http://127.0.0.1:8188" }
+      "args": { "url": "http://127.0.0.1:8188", "timeout_ms": 3000 }
     }
   ],
 
   // ---- 自动收起(idle/offline 太久把宠物收到任务栏后;托盘右键可勾选) ----
   "auto_hide": {
-    "enabled": false,         // 总开关;托盘勾选/取消即时切换,重启后保持
+    "enabled": true,          // 总开关(默认开启);托盘勾选/取消即时切换,重启后保持
     "after_sec": 30,          // idle/offline 持续多少秒后收起
     "y_factor": 0.4,          // 收起位置:y = 屏幕高度 − y_factor × 窗口高度
     "opacity": 0.3,           // 收起时额外透明度(0.05–1.0,叠加在渐隐系数上)
@@ -115,6 +116,8 @@ dist/
   //   "file": "scripts/tail_log.lua", // 脚本路径(相对 exe 目录)
   //   "poll_ms": 1000,                // 提示值;脚本用 pet.config().poll_ms 读
   //   "sandbox": false,               // true=禁用文件/进程访问
+  //   "enabled": true,                // false=不启动该接入口(托盘「接入口」子菜单可切换,写回此值)
+  //   "debug": false,                 // true=该脚本每条 pet.* 调用(事件名+关键字段)与启动 args 写进 hannis.log,便于排查
   //   "args": { "log": "D:\\MyGame\\game.log" }  // 脚本通过 pet.config().args 读
   // },
 
@@ -154,6 +157,9 @@ dist/
     "exempt_from_fade": true, // 气泡不随宠物渐隐(保持可读)
     "font_scale": 1.0,        // 气泡字体额外缩放(0.5–2.5,叠加系统 DPI)
     "type_cps": 90,           // 打字机效果:实时文字每秒逐字出现的速度(字符/秒);0=直接显示全部
+    "stack": true,            // 多源堆叠显示:Working/Thinking 时每个有活动的接入口一张级联卡
+                              // (前排卡显示流式内容,其余只露头部);false=单源气泡轮流显示
+    "rotate_ms": 5000,        // 轮流显示驻留时长(ms):内容静默超过该时长才轮到下一个候选会话
     "theme": {                // 气泡主题:dark 换深色预设;各字段 None=预设值;颜色为 "#RRGGBB"
       "dark": false,          // 深色预设(游戏/深色桌面场景推荐)
       "acrylic": false,       // DWM 系统毛玻璃(Win10+ 实验性,失败自动回退)
@@ -170,6 +176,12 @@ dist/
       "state_colors": null    // 如 { "working": "#4A8FE7", "done": "#E8A33D", ... }
                               // thinking/working/done/fail/attention/neutral
     }
+  },
+
+  // ---- 实时文本窗口 ----
+  "text": {
+    "max_chars": 1200         // 每个来源的实时文本(思考/输出流)保留的字符窗口(取尾部,默认 1200);
+                              // 气泡显示的就是这个窗口的尾部,调大=长回复在滚动滚出前能显示更多内容
   },
 
   // ---- 状态窗口期 ----
@@ -189,7 +201,18 @@ dist/
     "return_speed": 700       // 回原位速度(px/s):小=悠悠滑回去,大=加速归位
   },
 
-  // ---- 开机自启 ----
+  // ---- 鼠标穿透(托盘右键「鼠标穿透」可勾选) ----
+  "click_through": {
+    "enabled": false,         // true=窗口 WS_EX_TRANSPARENT,点击全部落到下层界面
+    "hover_opacity": 0.1      // 穿透时光标悬浮在宠物上的不透明度(0.05-1.0;越小越透)
+  },
+
+  // ---- 状态提示音(done/failed/attention 触发时播放 resource/ 下的 wav) ----
+  "sound": {
+    "enabled": true           // 托盘右键「提示音」可即时切换并写回此值
+  },
+
+  // ---- 开机自启(托盘右键「开机自启」可勾选) ----
   "autostart": false          // true=写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 }
 ```
@@ -275,9 +298,11 @@ app/            Rust 源码(lib 纯逻辑可测 + gui Windows 部分;可执行�
 tools/          make_sheets.js / split_webp.py 素材打包工具(webp -> sprite sheet)
                 mp4_to_sheet.js + keyer.js 绿幕 mp4 -> sprite sheet(CLI,与网页共用管线)
 web/mp4-keyer/  绿幕 mp4 转 sprite sheet 的本地网页工具(上传/预览/下载,node server.js)
+web/intro.html  录屏介绍页:浏览器打开,点击逐句大字展示+少女声 TTS 讲解;右下角箭头可拖动
 resource/       宠物素材(sprite sheet)
-scripts/        随程序发布的 Lua 示例脚本(maa/comfyui/tail_log/process_watch)
+scripts/        随程序发布的 Lua 接入口脚本(dsh/hermes/maa/comfyui + tail_log/process_watch 示例)
 icon.png        程序图标(托盘/窗口;部署时放到 exe 同目录)
 out/            素材处理历史脚本(绿幕抠除等)
-adding-connectors.md   给程序添加新消息来源(连接器)的接入指南
+scripts-guide.md 接入口指南:Lua 脚本接入(pet.* API / 线格式参考)
+                 + 宿主架构与 StateEvent 契约(原 adding-connectors.md 已并入)
 ```

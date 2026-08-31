@@ -18,9 +18,9 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-/// 每个接入口在窗口里的布局快照(模态期间 cfg 不变)。
+/// 每个接入口在窗口里的布局快照(模态期间 cfg 不变)。脚本名/启停状态
+/// 走 PILLS;这里只存参数行的 (键, 显示标签)。
 struct Row {
-    label: String,
     /// (参数键, 显示标签)
     keys: Vec<(String, String)>,
 }
@@ -181,7 +181,7 @@ pub fn open_settings(app: &mut App) {
             .collect();
         args_all.push(args);
         pills.push((label.clone(), sc.enabled));
-        rows.push(Row { label, keys });
+        rows.push(Row { keys });
     }
     if rows.is_empty() {
         log_line("[settings] no scripts configured");

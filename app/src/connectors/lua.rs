@@ -21,7 +21,7 @@ use crate::config::ScriptEntryConfig;
 use crate::state::{register_script_label, SessionItem, Source, StateEvent, TodoItem, TurnEndReason};
 use mlua::{Lua, Table, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -156,8 +156,17 @@ impl LuaScriptConnector {
         let args_s: String = args_s.chars().take(300).collect();
         self.log(&format!("started ({} bytes) args={}", src.len(), args_s));
         match func.call::<()>(()) {
-            Ok(()) => self.fail(&tx, "script returned (not looping) — source stopped"),
-            Err(e) => self.fail(&tx, &format!("script error: {e}")),
+            Ok(()) => {
+                self.fail(&tx, "script returned (not looping) — source stopped");
+                // 脚本线程退出:它已发出的审批/提问再也没有人能 resolve(没有
+                // replay——服务端重放只在 ws 场景、且脚本已死),补发 pending_sync
+                // 清掉本源残留,否则宠物最长卡 Attention 30 分钟(等 TTL 兜底)
+                super::send(&tx, StateEvent::PendingSync { source: Source::Script(self.id) });
+            }
+            Err(e) => {
+                self.fail(&tx, &format!("script error: {e}"));
+                super::send(&tx, StateEvent::PendingSync { source: Source::Script(self.id) });
+            }
         }
     }
 
@@ -249,7 +258,6 @@ impl LuaScriptConnector {
         let pet = lua.create_table()?;
 
         let f = {
-            let tx = tx.clone();
             let log = log.clone();
             lua.create_function(move |_, (level, msg): (String, String)| {
                 log(format!("{level}: {msg}"));
@@ -259,7 +267,6 @@ impl LuaScriptConnector {
         pet.set("log", f)?;
 
         let f = {
-            let tx = tx.clone();
             lua.create_function(move |_, ms: u64| {
                 sleep_interruptible(ms, &stop);
                 Ok(())
@@ -269,7 +276,6 @@ impl LuaScriptConnector {
 
         let f = {
             let tx = tx.clone();
-            let sid = sid.clone();
             lua.create_function(move |_, ok: bool| {
                 send(&tx, StateEvent::SourceHealth { source, healthy: ok });
                 Ok(())
@@ -483,11 +489,19 @@ impl LuaScriptConnector {
                 let mut out = Vec::new();
                 for v in todos.sequence_values::<Value>() {
                     let v = v?;
-                    if let Value::Table(t) = v {
-                        let content: String = t.get("content")?;
-                        let status: String = t.get("status")?;
-                        out.push(TodoItem { content, status });
-                    }
+                    // 宽容解析:用户脚本的信息常有缺漏。content 缺失/非字符串
+                    // 跳过该条,status 缺失按 pending——绝不让一个坏条目把整条
+                    // 脚本炸掉(旧实现类型不符直接 Err,脚本线程即死)。
+                    let Value::Table(t) = v else { continue };
+                    let content = match t.get::<Value>("content")? {
+                        Value::String(s) => s.to_str()?.to_string(),
+                        _ => continue,
+                    };
+                    let status = match t.get::<Value>("status")? {
+                        Value::String(s) => s.to_str()?.to_string(),
+                        _ => "pending".to_string(),
+                    };
+                    out.push(TodoItem { content, status });
                 }
                 send(&tx, StateEvent::TodoSnapshot {
                     source,
@@ -506,32 +520,47 @@ impl LuaScriptConnector {
                 let mut out = Vec::new();
                 for v in items.sequence_values::<Value>() {
                     let v = v?;
-                    if let Value::Table(t) = v {
-                        let session_id: String = t.get("session_id")?;
-                        let running: bool = t.get("running")?;
-                        let title: Option<String> = t.get("title")?;
-                        let todos = match t.get::<Option<Table>>("todos")? {
-                            Some(tt) => {
-                                let mut v = Vec::new();
-                                for x in tt.sequence_values::<Value>() {
-                                    let x = x?;
-                                    if let Value::Table(xt) = x {
-                                        let content: String = xt.get("content")?;
-                                        let status: String = xt.get("status")?;
-                                        v.push(TodoItem { content, status });
-                                    }
-                                }
-                                Some(v)
+                    let Value::Table(t) = v else { continue };
+                    // 宽容解析(见 pet.todo):session_id 缺失/类型不符 → 跳过
+                    // 该条目(数字 id 转字符串);running 缺失 → false;title/
+                    // todos 类型不符 → 忽略。基线快照容错降级,而不是脚本崩掉。
+                    let session_id = match t.get::<Value>("session_id")? {
+                        Value::String(s) => s.to_str()?.to_string(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Number(n) => n.to_string(),
+                        _ => continue,
+                    };
+                    let running = matches!(t.get::<Value>("running")?, Value::Boolean(true));
+                    let title = match t.get::<Value>("title")? {
+                        Value::String(s) => Some(s.to_str()?.to_string()),
+                        _ => None,
+                    };
+                    let todos = match t.get::<Value>("todos")? {
+                        Value::Table(tt) => {
+                            let mut v = Vec::new();
+                            for x in tt.sequence_values::<Value>() {
+                                let x = x?;
+                                let Value::Table(xt) = x else { continue };
+                                let content = match xt.get::<Value>("content")? {
+                                    Value::String(s) => s.to_str()?.to_string(),
+                                    _ => continue,
+                                };
+                                let status = match xt.get::<Value>("status")? {
+                                    Value::String(s) => s.to_str()?.to_string(),
+                                    _ => "pending".to_string(),
+                                };
+                                v.push(TodoItem { content, status });
                             }
-                            None => None,
-                        };
-                        out.push(SessionItem {
-                            session_id: sid(session_id),
-                            running,
-                            title,
-                            todos,
-                        });
-                    }
+                            Some(v)
+                        }
+                        _ => None,
+                    };
+                    out.push(SessionItem {
+                        session_id: sid(session_id),
+                        running,
+                        title,
+                        todos,
+                    });
                 }
                 send(&tx, StateEvent::Poll { source, items: out, ok: true, error: None });
                 Ok(())
@@ -654,7 +683,7 @@ impl LuaScriptConnector {
                     return Err(mlua::Error::runtime("pet.sqlite is disabled in sandbox mode"));
                 }
                 use rusqlite::types::Value as SqlValue;
-                let mut conn = rusqlite::Connection::open_with_flags(
+                let conn = rusqlite::Connection::open_with_flags(
                     &path,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
                 )
@@ -790,6 +819,31 @@ mod tests {
     use super::*;
     use crate::state::TurnEndReason;
     use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    /// 随包脚本必须能被 Lua 编译(防语法错误回归;只编译不执行,
+    /// 脚本主循环不会真的跑起来)。
+    #[test]
+    fn shipped_scripts_compile() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts");
+        let lua = mlua::Lua::new();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("lua") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let r = lua.load(&src).set_name(p.display().to_string()).into_function();
+            assert!(r.is_ok(), "lua compile failed for {}: {:?}", p.display(), r.err());
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected the shipped scripts, found {checked}");
+    }
 
     fn tmp_script(src: &str) -> (tempfile::Dir, PathBuf) {
         let dir = tempfile::Dir::new();
@@ -900,6 +954,48 @@ mod tests {
         // healthy=true then healthy=false (error)
         assert!(evs.iter().any(|e| matches!(e, StateEvent::SourceHealth { healthy: true, .. })));
         assert!(evs.iter().any(|e| matches!(e, StateEvent::SourceHealth { healthy: false, .. })));
+        // 脚本死亡:补发 pending_sync 清残留审批/提问(否则最长卡 Attention 30min)
+        assert!(evs.iter().any(|e| matches!(e, StateEvent::PendingSync { source: Source::Script(3) })));
+    }
+
+    #[test]
+    fn poll_and_todo_tolerate_missing_fields() {
+        // 用户脚本的信息常有缺漏:缺字段/类型不符必须降级处理(跳过条目、
+        // 默认值),而不是类型错误把整条脚本炸掉
+        let (_d, p) = tmp_script(
+            r#"
+            pet.poll({
+              { session_id = "a", running = true, todos = { { content = "c1" }, { content = "c2", status = "done" }, "junk" } },
+              { running = true },   -- 缺 session_id:整条跳过
+              { session_id = 42 },  -- 数字 id:转字符串,running 默认 false
+            })
+            pet.todo("a", { { content = "t1" }, { content = "t2", status = "completed" }, 7 })
+            "#,
+        );
+        let evs = run_script(entry(p, "LenientApp"), 21);
+        assert!(evs.iter().any(|e| matches!(e, StateEvent::SourceHealth { healthy: true, .. })),
+            "缺字段不得把脚本炸掉: {evs:?}");
+        let poll = evs.iter().find_map(|e| match e {
+            StateEvent::Poll { items, ok, .. } if *ok => Some(items.clone()),
+            _ => None,
+        });
+        let items = poll.expect("poll event");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].session_id, "script-21-a");
+        assert!(items[0].running);
+        let todos = items[0].todos.as_ref().unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].status, "pending"); // 缺 status → 默认 pending
+        assert_eq!(todos[1].status, "done");
+        assert_eq!(items[1].session_id, "script-21-42");
+        assert!(!items[1].running); // 缺 running → false
+        let todo = evs.iter().find_map(|e| match e {
+            StateEvent::TodoSnapshot { todos, .. } => Some(todos.clone()),
+            _ => None,
+        });
+        let todos = todo.expect("todo event");
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].status, "pending");
     }
 
     #[test]
@@ -1075,9 +1171,183 @@ mod tests {
         let evs = run_script(e, 15);
         assert!(evs.iter().any(|e| matches!(e, StateEvent::SourceHealth { healthy: true, .. })));
     }
+
+    /// scripts/ 下随包脚本路径(行为级测试直接跑真脚本)。
+    fn script_path(name: &str) -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts")
+            .join(name)
+            .display()
+            .to_string()
+    }
+
+    /// 回归:dsh.lua 的 session/jobs 必须按 (sessionId, jobId) 成对发
+    /// tool_started/tool_ended。旧实现每会话只留一槽:同帧两个 job 会漏发
+    /// 第二个的 started、第一个的 ended,宿主被钉在 Working;job 从快照
+    /// 消失的帧也必须补发 tool_ended(旧实现静默清除)。
+    #[test]
+    fn dsh_mux_jobs_track_per_job() {
+        use std::sync::atomic::AtomicU32;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let mux_served = Arc::new(AtomicU32::new(0));
+        let served2 = mux_served.clone();
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(s) = stream else { break };
+                let served3 = served2.clone();
+                std::thread::spawn(move || {
+                    let mut s = s;
+                    let mut buf = [0u8; 8192];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let is_ws = req.contains("events.mux") || req.contains("events.host");
+                    if !is_ws {
+                        // session.list 等 HTTP 请求:500 快速失败
+                        let _ = s.write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                        );
+                        return;
+                    }
+                    let _ = s.write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: abc\r\n\r\n",
+                    );
+                    let _ = s.flush();
+                    if req.contains("events.mux")
+                        && served3.swap(1, Ordering::SeqCst) == 0
+                    {
+                        let mut send_text = |text: &str| {
+                            let payload = text.as_bytes();
+                            let mut frame = vec![0x81u8];
+                            if payload.len() < 126 {
+                                frame.push(payload.len() as u8);
+                            } else {
+                                frame.push(126);
+                                frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                            }
+                            frame.extend_from_slice(payload);
+                            let _ = s.write_all(&frame);
+                            let _ = s.flush();
+                        };
+                        send_text(
+                            r#"{"payload":{"type":"session/jobs","sessionId":"s1","jobs":[{"id":"A","status":"running"},{"id":"B","status":"running"}]}}"#,
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        // 空快照:两个 job 消失 → 都要补 tool_ended
+                        send_text(r#"{"payload":{"type":"session/jobs","sessionId":"s1","jobs":[]}}"#);
+                    }
+                    // 保持连接打开,避免脚本立刻重连干扰断言
+                    std::thread::sleep(std::time::Duration::from_millis(10_000));
+                });
+            }
+        });
+
+        let cfg = ScriptEntryConfig {
+            name: "DSH".into(),
+            file: script_path("dsh.lua"),
+            poll_ms: 1000,
+            args: Some(serde_json::json!({ "url": url })),
+            ..Default::default()
+        };
+        let stop = crate::connectors::stop_flag();
+        let (tx, rx) = std::sync::mpsc::channel();
+        make(22, cfg, None).spawn(tx, stop.clone());
+
+        let started = Instant::now();
+        let mut evs = Vec::new();
+        while started.elapsed() < Duration::from_secs(8) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => evs.push(ev),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+            let has = |pat: &dyn Fn(&StateEvent) -> bool| evs.iter().any(|e| pat(e));
+            let started_ok = has(&|e| matches!(e, StateEvent::ToolStarted { name, session_id, .. } if session_id == "script-22-s1" && name == "job:A"))
+                && has(&|e| matches!(e, StateEvent::ToolStarted { name, .. } if name == "job:B"));
+            let ended_ok = has(&|e| matches!(e, StateEvent::ToolEnded { name, .. } if name == "job:A"))
+                && has(&|e| matches!(e, StateEvent::ToolEnded { name, .. } if name == "job:B"));
+            if started_ok && ended_ok {
+                break;
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+
+        let has = |pat: &dyn Fn(&StateEvent) -> bool| evs.iter().any(|e| pat(e));
+        assert!(
+            has(&|e| matches!(e, StateEvent::ToolStarted { name, session_id, .. } if session_id == "script-22-s1" && name == "job:A"))
+                && has(&|e| matches!(e, StateEvent::ToolStarted { name, .. } if name == "job:B")),
+            "两个 job 都必须发 tool_started: {evs:?}"
+        );
+        assert!(
+            has(&|e| matches!(e, StateEvent::ToolEnded { name, .. } if name == "job:A"))
+                && has(&|e| matches!(e, StateEvent::ToolEnded { name, .. } if name == "job:B")),
+            "job 从快照消失必须补发 tool_ended: {evs:?}"
+        );
+    }
+
+    /// 回归:maa.lua 的"资深干员-only 链"(链内从未有连接/任务)在 attention
+    /// 自动解除后必须中性收尾,否则会话永远 running,宠物被永久钉在 Thinking。
+    #[test]
+    fn maa_senior_only_chain_ends_neutrally() {
+        let dir = tempfile::Dir::new();
+        let log = dir.path().join("gui.log");
+        std::fs::write(&log, "").unwrap();
+        let cfg = ScriptEntryConfig {
+            name: "MAA".into(),
+            file: script_path("maa.lua"),
+            poll_ms: 50,
+            args: Some(serde_json::json!({ "log": log.display().to_string(), "attention_ms": 0 })),
+            ..Default::default()
+        };
+        let stop = crate::connectors::stop_flag();
+        let (tx, rx) = std::sync::mpsc::channel();
+        make(23, cfg, None).spawn(tx, stop.clone());
+        // 等启动扫描读完(空)日志、进入 tail 循环后再追加"资深干员"行:
+        // 启动扫描只认 connect/start/done/stop/clear,已有行不会驱动状态机
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(f, "[01-01 10:00:00.000][TRACE][MeoAssistant] <1> 识别到资深干员信息").unwrap();
+        }
+
+        let started = Instant::now();
+        let mut evs = Vec::new();
+        while started.elapsed() < Duration::from_secs(5) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => evs.push(ev),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+            if evs.iter().any(|e| matches!(e, StateEvent::TurnEnded { .. })) {
+                break;
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+
+        assert!(
+            evs.iter().any(|e| matches!(e, StateEvent::TurnStarted { session_id, .. } if session_id.starts_with("script-23-maa-"))),
+            "资深干员应开链: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, StateEvent::QuestionRequested { text, .. } if text.contains("资深干员"))),
+            "应发出提问: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, StateEvent::QuestionResolved { .. })),
+            "attention 应自动解除: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, StateEvent::TurnEnded { reason: crate::state::TurnEndReason::Aborted, .. })),
+            "空链必须中性收尾(否则永久 Thinking): {evs:?}"
+        );
+    }
 }
 
-/// Tiny temp-dir helper (no extra deps).
+/// Tiny temp-dir helper (no extra deps; tests only).
+#[cfg(test)]
 mod tempfile {
     pub struct Dir(pub std::path::PathBuf);
     impl Dir {

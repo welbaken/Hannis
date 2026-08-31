@@ -107,6 +107,12 @@ local function resolve_q()
 end
 
 local function start_chain(label)
+  -- 上一条链若还开着但是"空"的(从未有连接/任务,如资深干员-only 链)先中性
+  -- 收尾:否则旧会话在宿主里永远 running,宠物被永久钉在 Thinking(下一条
+  -- 链会用新 session id,旧账目没有任何事件再来翻转)
+  if session_id and not run_ended and not connect_open and not task then
+    pet.session_ended(session_id, turn, "aborted")
+  end
   session_id = "maa-" .. tostring(os.time())
   turn = 1
   connect_open = false
@@ -315,6 +321,13 @@ while true do
   -- 资深干员 attention 自动消除(不等待人工确认,约 attention_ms 秒)
   if pending_q and os.time() - pending_at >= math.ceil(attention_ms / 1000) then
     resolve_q()
+    -- 资深干员-only 链(链内从未有连接/任务)解除后中性收尾:否则该会话
+    -- 永远 running,宠物被永久钉在 Thinking;之后再有任务会由
+    -- on_connect/on_task_start 开新链(或复用本链,见 start_chain 的空链收尾)
+    if session_id and not run_ended and not connect_open and not task then
+      pet.session_ended(session_id, turn, "aborted")
+      run_ended = true
+    end
   end
 
   ::continue::

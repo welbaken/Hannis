@@ -9,13 +9,15 @@ pub mod tray;
 pub mod window;
 
 use dshpet::anim::{load_animation, load_loop_animation, Animation, Frame, Player};
+use dshpet::bubble_stack;
 use dshpet::bubble_text;
 use dshpet::config::Config;
 use dshpet::connectors::stop_flag;
 use dshpet::state::{Mode, PetState, Snapshot, StateEvent};
 pub mod settings;
+pub mod sound;
 use dshpet::config::ScriptEntryConfig;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,7 +166,7 @@ pub struct App {
     pub reveal: Option<(String, u8, f32)>,
     /// 轮流显示: session whose message the bubble currently shows, and the
     /// last time (now_ms) that message changed. A pick whose message stays
-    /// unchanged for ROTATE_AFTER_MS is handed to another session with content.
+    /// unchanged for bubble.rotate_ms is handed to another session with content.
     pub bubble_pick: Option<String>,
     pub bubble_stale_since: Option<u64>,
     pub last_interaction: Instant,
@@ -218,9 +220,25 @@ pub struct App {
     pub collapse_anim: Option<(i32, i32)>,
     /// 气泡淡入系数(0..1):出现时 200ms 内从 0 → 1(配合 8px 滑入)。
     pub bubble_fade: f32,
+    /// 鼠标穿透悬浮的气泡变暗系数(0.05..1,与本体同步 lerp):光标悬在
+    /// 宠物上时气泡随本体一起压到 hover_opacity(透视下层);平时恒 1.0,
+    /// 气泡的免渐隐可读性不变。
+    pub bubble_hover_dim: f32,
+    /// 上一次 compose 时的 bubble_hover_dim(变化超阈值才重绘)。
+    pub composed_bubble_dim: f32,
     /// 自动收起恢复后:回避模式先挂起,直到光标首次离开宠物(避免"叫回来
     /// 立刻又被躲开/被回避拉扯回不了原位")。
     pub avoid_arm_after_leave: bool,
+    /// 多源堆叠(bubble.stack):每源出现/消失滞后计时(源 id → 状态)。
+    pub stack_state: BTreeMap<u16, bubble_stack::StackState>,
+    /// 多源堆叠卡池(源 id → (卡 widget, 出现时刻 now_ms)):按源池化保住
+    /// layout 早退(内容与几何都没变时零开销),每卡出现时 200ms 淡入。
+    pub stack_pool: BTreeMap<u16, (bubble::Bubble, u64)>,
+    /// 多源堆叠缓存:timer_tick 算出的当前卡列表(后→前,末位 = 前排卡),
+    /// compose 按此顺序级联绘制。
+    pub stack_cache: Vec<bubble_stack::StackCard>,
+    /// 提示音:上一拍的快照模式,用于检测"进入 Attention"沿(播放 attention 音)。
+    pub sound_prev_mode: Mode,
 }
 
 fn now_ms() -> u64 {
@@ -242,8 +260,7 @@ pub fn run() {
     unsafe {
         let _h = CreateMutexW(None, false, w!("hannis-single-instance")).unwrap_or(HANDLE::default());
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            let existing = unsafe { FindWindowW(w!("hannis"), PCWSTR::null()) }
-                .unwrap_or(HWND::default());
+            let existing = FindWindowW(w!("hannis"), PCWSTR::null()).unwrap_or(HWND::default());
             if existing.0.is_null() {
                 eprintln!("[gui] stale instance without a window - cleaning up");
                 kill_stale_instances();
@@ -254,11 +271,13 @@ pub fn run() {
                 // multi-monitor quirk) is as good as gone and would brick
                 // every relaunch, so we kill the stale process instead.
                 let mut r = RECT::default();
-                unsafe { GetWindowRect(existing, &mut r) };
-                let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-                let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-                let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-                let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+                // 失败(窗口恰在检查间隙销毁)时 r 保持全零 → offscreen →
+                // 走 stale 清理,与本分支语义一致,可安全忽略返回值
+                let _ = GetWindowRect(existing, &mut r);
+                let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
                 let onscreen = r.right > vx && r.left < vx + vw && r.bottom > vy && r.top < vy + vh;
                 if onscreen {
                     eprintln!("hannis already running");
@@ -372,7 +391,13 @@ pub fn run() {
         collapse_clip: 0,
         collapse_anim: None,
         bubble_fade: 0.0,
+        bubble_hover_dim: 1.0,
+        composed_bubble_dim: 1.0,
         avoid_arm_after_leave: false,
+        stack_state: BTreeMap::new(),
+        stack_pool: BTreeMap::new(),
+        stack_cache: Vec::new(),
+        sound_prev_mode: Mode::Idle,
     });
     app.pet.set_celebrate_ms(celebrate_ms);
     app.bubble.theme = bubble_theme;
@@ -382,6 +407,11 @@ pub fn run() {
     app.comp = render::Compositor::new(hwnd, font_scale);
     // 上一帧快照只在亚克力需要反混合时保留(省 ~3MB 常驻)
     app.comp.keep_last_frame = acrylic_on;
+    // 鼠标穿透(配置开启则启动即生效;窗口收不到鼠标消息,悬浮检测走轮询)
+    if app.cfg.click_through.enabled {
+        window::set_click_through(hwnd, true);
+        log_line("[click-through] enabled from config at startup");
+    }
     window::set_window_rect(hwnd, x, y, w, h);
     window::show(hwnd);
     // 注意:不再对整窗调用 DWM accent(SetWindowCompositionAttribute):
@@ -582,6 +612,24 @@ impl App {
         let snap = self.pet.snapshot();
         self.base_mode = snap.mode;
 
+        // 2b) 提示音:done/failed 用状态机的沿标记;attention 用模式进入沿。
+        //     托盘「提示音」关掉后不播(配置写回 config.json)。沿标记无论
+        //     开关都要消费掉:否则关闭期间积压的 done/fail 标志会在重新
+        //     开启后补响一声旧事件。
+        let (done_snd, fail_snd) = self.pet.consume_sounds();
+        if self.cfg.sound.enabled {
+            if done_snd {
+                sound::play(&self.resource_dir, "done");
+            }
+            if fail_snd {
+                sound::play(&self.resource_dir, "failed");
+            }
+            if snap.mode == Mode::Attention && self.sound_prev_mode != Mode::Attention {
+                sound::play(&self.resource_dir, "attention");
+            }
+        }
+        self.sound_prev_mode = snap.mode;
+
         // 3) effective mode (drag overlay: move animation only for idle)
         let effective = self.effective_mode();
         if effective != self.mode {
@@ -698,7 +746,8 @@ impl App {
         //    from bubble_text::BubbleText, using the wide per-line window
         //    (text.max_chars).
         // 气泡淡入:出现时 200ms 从 0→1(内容为空则立即归零)
-        let fade_target = if self.bubble.visible() { 1.0 } else { 0.0 };
+        let stack_shown = self.cfg.bubble.stack && !self.stack_cache.is_empty();
+        let fade_target = if self.bubble.visible() || stack_shown { 1.0 } else { 0.0 };
         let fade_k = ((dt as f32) / 200.0).min(1.0);
         self.bubble_fade += (fade_target - self.bubble_fade) * fade_k;
         if self.bubble_fade > 0.999 {
@@ -712,6 +761,7 @@ impl App {
         let max_chars = self.cfg.text.max_chars;
         let tick_now = now_ms();
         if matches!(effective, Mode::Idle | Mode::Offline | Mode::Move) {
+            self.clear_stack();
             self.bubble_pick = None;
             self.bubble_stale_since = None;
             self.reveal = None;
@@ -727,64 +777,71 @@ impl App {
                 self.dirty_request = true;
             }
         } else if matches!(effective, Mode::Thinking | Mode::Working) {
-            // 轮流显示: keep the current session while its message keeps
-            // updating; once it has been static for ROTATE_AFTER_MS and
-            // another session has content, hand the bubble over to it.
-            let stale = self
-                .bubble_stale_since
-                .map(|at| tick_now.saturating_sub(at) >= bubble_text::ROTATE_AFTER_MS)
-                .unwrap_or(false);
-            let pick = bubble_text::rotate_pick(&snap, sel, effective, self.bubble_pick.as_deref(), stale);
-            if pick != self.bubble_pick {
-                self.bubble_pick = pick.clone();
-                self.bubble_stale_since = Some(tick_now);
-            }
-            let prefer = self.bubble_pick.as_deref();
-            let pos = if type_cps > 0 {
-                // typewriter: reveal the live stream char by char
-                let stream = bubble_text::live_stream_pinned(&snap, sel, effective, prefer);
-                let same = match (&self.reveal, &stream) {
-                    (Some((sid, kind, _)), Some(s)) => *sid == s.session_id && *kind == s.kind,
-                    (None, None) => true,
-                    _ => false,
-                };
-                if !same {
-                    // new session / new stream (e.g. next turn): start over
-                    self.reveal = stream.as_ref().map(|s| (s.session_id.clone(), s.kind, 0.0));
-                }
-                let p = match (&mut self.reveal, &stream) {
-                    (Some((_, _, pos)), Some(s)) => {
-                        *pos += type_cps as f32 * dt as f32 / 1000.0;
-                        let p = (*pos as usize).min(s.len);
-                        // keep up with a fast stream: never lag more than one
-                        // and a half visible windows behind the newest chars
-                        if s.len.saturating_sub(p) > TYPE_LAG_CHARS {
-                            *pos = (s.len - TYPE_LAG_CHARS) as f32;
-                        }
-                        Some(p)
-                    }
-                    _ => None,
-                };
-                p
+            if self.cfg.bubble.stack {
+                // 多源堆叠路径:每个有活动会话的接入口一张级联卡
+                self.update_stack_bubble(&snap, effective, tick_now, dt, type_cps, max_chars);
             } else {
-                self.reveal = None;
-                None
-            };
-            let text = bubble_text::bubble_text_pinned(&snap, sel, prefer, pos, max_chars);
-            // a changed message resets the staleness timer
-            if text != self.bubble_text {
-                self.bubble_stale_since = Some(tick_now);
-                self.bubble_text = text;
-                self.dirty_request = true;
-            }
-            // 每帧按当前 pet 尺寸重排:宠物缩小后旧的大气泡会把下段顶出
-            // 窗口底部被截断;layout 在文本与几何都未变时直接返回(零开销)
-            let pet_w = self.pet_size().0;
-            let pet_h = self.pet_size().1;
-            if self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp) {
-                self.dirty_request = true;
+                self.clear_stack();
+                // 轮流显示: keep the current session while its message keeps
+                // updating; once it has been static for rotate_ms and
+                // another session has content, hand the bubble over to it.
+                let stale = self
+                    .bubble_stale_since
+                    .map(|at| tick_now.saturating_sub(at) >= self.cfg.bubble.rotate_ms)
+                    .unwrap_or(false);
+                let pick = bubble_text::rotate_pick(&snap, sel, effective, self.bubble_pick.as_deref(), stale);
+                if pick != self.bubble_pick {
+                    self.bubble_pick = pick.clone();
+                    self.bubble_stale_since = Some(tick_now);
+                }
+                let prefer = self.bubble_pick.as_deref();
+                let pos = if type_cps > 0 {
+                    // typewriter: reveal the live stream char by char
+                    let stream = bubble_text::live_stream_pinned(&snap, sel, effective, prefer);
+                    let same = match (&self.reveal, &stream) {
+                        (Some((sid, kind, _)), Some(s)) => *sid == s.session_id && *kind == s.kind,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        // new session / new stream (e.g. next turn): start over
+                        self.reveal = stream.as_ref().map(|s| (s.session_id.clone(), s.kind, 0.0));
+                    }
+                    let p = match (&mut self.reveal, &stream) {
+                        (Some((_, _, pos)), Some(s)) => {
+                            *pos += type_cps as f32 * dt as f32 / 1000.0;
+                            let p = (*pos as usize).min(s.len);
+                            // keep up with a fast stream: never lag more than one
+                            // and a half visible windows behind the newest chars
+                            if s.len.saturating_sub(p) > TYPE_LAG_CHARS {
+                                *pos = (s.len - TYPE_LAG_CHARS) as f32;
+                            }
+                            Some(p)
+                        }
+                        _ => None,
+                    };
+                    p
+                } else {
+                    self.reveal = None;
+                    None
+                };
+                let text = bubble_text::bubble_text_pinned(&snap, sel, prefer, pos, max_chars);
+                // a changed message resets the staleness timer
+                if text != self.bubble_text {
+                    self.bubble_stale_since = Some(tick_now);
+                    self.bubble_text = text;
+                    self.dirty_request = true;
+                }
+                // 每帧按当前 pet 尺寸重排:宠物缩小后旧的大气泡会把下段顶出
+                // 窗口底部被截断;layout 在文本与几何都未变时直接返回(零开销)
+                let pet_w = self.pet_size().0;
+                let pet_h = self.pet_size().1;
+                if self.bubble.layout(self.bubble_text.clone(), pet_w, pet_h, &self.comp) {
+                    self.dirty_request = true;
+                }
             }
         } else {
+            self.clear_stack();
             self.reveal = None;
             self.bubble_pick = None;
             self.bubble_stale_since = None;
@@ -835,6 +892,10 @@ impl App {
             if (self.fade_alpha - self.composed_fade).abs() > 0.002 {
                 dirty = true;
             }
+            // 气泡悬浮变暗系数变化也要重绘(穿透悬浮的淡入/恢复)
+            if (self.bubble_hover_dim - self.composed_bubble_dim).abs() > 0.002 {
+                dirty = true;
+            }
             let (_, _, w, h) = self.window_size();
             if w as u32 != self.comp.win_w || h as u32 != self.comp.win_h {
                 dirty = true;
@@ -847,6 +908,7 @@ impl App {
                     .map(|a| a.name.clone())
                     .zip(self.player.as_ref().map(|p| p.idx));
                 self.composed_fade = self.fade_alpha;
+                self.composed_bubble_dim = self.bubble_hover_dim;
             }
         }
     }
@@ -984,11 +1046,23 @@ impl App {
             .iter()
             .any(|s| s.as_str() == self.mode.asset() || s.as_str() == format!("{:?}", self.mode).to_lowercase());
         let idle_for = self.last_interaction.elapsed().as_secs();
+        let hover = self.cfg.click_through.enabled
+            && !self.hidden
+            && !self.collapsed
+            && self.cursor_over_pet();
         let mut target = if disabled || idle_for < self.cfg.fade.fade_after_sec {
             1.0
         } else {
             self.cfg.fade.fade_target.clamp(0.0, 1.0)
         };
+        // 鼠标穿透悬浮反馈:光标悬在宠物上时把不透明度压到 hover_opacity
+        // (默认 0.1 = 透明度 90%,透视看到下层界面),移开后恢复。穿透状态
+        // 下窗口收不到鼠标消息,悬浮检测只能轮询光标位置;收起状态有自己的
+        // 悬停唤回逻辑,不参与;全屏隐藏时窗口不可见,同样跳过。
+        let hover_dim = self.cfg.click_through.hover_opacity.clamp(0.05, 1.0);
+        if hover {
+            target = target.min(hover_dim);
+        }
         if self.collapsed {
             // 自动收起:在渐隐基础上进一步变透明(同一套 lerp 平滑过渡)
             target *= self.cfg.auto_hide.opacity.clamp(0.05, 1.0);
@@ -999,6 +1073,22 @@ impl App {
         if (self.fade_alpha - target).abs() < 0.005 {
             self.fade_alpha = target;
         }
+        // 气泡跟随悬浮变暗(单源气泡与堆叠卡统一生效):与本体同一速度
+        // lerp;不悬浮时回到 1.0,平时的免渐隐可读性不变
+        let dim_target = if hover { hover_dim } else { 1.0 };
+        self.bubble_hover_dim += (dim_target - self.bubble_hover_dim) * k;
+        if (self.bubble_hover_dim - dim_target).abs() < 0.005 {
+            self.bubble_hover_dim = dim_target;
+        }
+    }
+
+    /// 光标当前是否悬在宠物的可见本体上(屏幕坐标;本体的非透明 bbox,
+    /// 气泡留白不算)。鼠标穿透开启时窗口收不到鼠标消息,悬浮检测全靠它。
+    fn cursor_over_pet(&self) -> bool {
+        let (cx, cy) = window::cursor_pos();
+        let (wx, wy, _, _) = self.window_size();
+        let (fx, fy, fw, fh) = self.pet_visual_rect();
+        cx >= wx + fx && cx < wx + fx + fw.max(1) && cy >= wy + fy && cy < wy + fy + fh.max(1)
     }
 
     /// 回避模式 (avoid mode). While enabled the pet dodges the cursor and,
@@ -1223,7 +1313,7 @@ impl App {
     }
 
     fn enter_collapse(&mut self) {
-        let (x, y, w, h) = self.window_size();
+        let (x, y, _w, h) = self.window_size();
         self.collapse_home = Some((x, y));
         self.collapsed = true;
         self.collapse_hover_since = None;
@@ -1252,7 +1342,9 @@ impl App {
         self.collapsed = false;
         self.collapse_hover_since = None;
         self.collapse_clip = 0;
-        window::set_click_through(self.hwnd, false);
+        // 收起时的点击穿透恢复为"配置要求的状态":鼠标穿透开关开启时
+        // 保持穿透,否则解除(原来无条件解除会破坏「鼠标穿透」设置)
+        window::set_click_through(self.hwnd, self.cfg.click_through.enabled);
         if let Some((hx, hy)) = self.collapse_home.take() {
             // 滑回原位(从当前位置开始)
             self.collapse_anim = Some((hx, hy));
@@ -1276,6 +1368,37 @@ impl App {
             // 从头计时,避免用旧的 idle 时长立即触发
             self.collapse_idle_since = Some(Instant::now());
         }
+    }
+
+    /// 托盘「开机自启」勾选切换:写回 config.json 并同步 HKCU Run 注册表项。
+    fn toggle_autostart(&mut self) {
+        self.cfg.autostart = !self.cfg.autostart;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        let exe_path =
+            std::env::current_exe().unwrap_or_else(|_| self.exe_dir().join("hannis.exe"));
+        apply_autostart(&self.cfg, &exe_path);
+        log_line(&format!("[autostart] tray toggle -> {}", self.cfg.autostart));
+    }
+
+    /// 托盘「鼠标穿透」勾选切换:写回 config.json 并即时生效。开启后窗口
+    /// 加 WS_EX_TRANSPARENT,宠物不再拦截鼠标(也无法拖拽),点击/滚轮全部
+    /// 落到下层界面;光标悬浮在宠物上时不透明度压到 hover_opacity(默认
+    /// 0.1 = 透明度 90%),本体与气泡一起透视下层(见 update_fade)。重启保持。
+    fn toggle_click_through(&mut self) {
+        self.cfg.click_through.enabled = !self.cfg.click_through.enabled;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        // 收起状态本身依赖点击穿透:此时关掉开关也保持穿透,等退出收起时
+        // 由 exit_collapse 按配置恢复
+        let effective = self.cfg.click_through.enabled || self.collapsed;
+        window::set_click_through(self.hwnd, effective);
+        log_line(&format!("[click-through] tray toggle -> {}", self.cfg.click_through.enabled));
+    }
+
+    /// 托盘「提示音」开关:写回 config.json,立即生效(下一拍按新状态播)。
+    fn toggle_sound(&mut self) {
+        self.cfg.sound.enabled = !self.cfg.sound.enabled;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        log_line(&format!("[sound] tray toggle -> {}", self.cfg.sound.enabled));
     }
 
     /// Re-scan the loaded animation's first frame for the bbox of non-
@@ -1315,13 +1438,11 @@ impl App {
     /// dragging). 本体大部分可拖出屏外,只要求至少保留 DRAG_SLIVER_PX 可见;
     /// 横向按本体的可见盒(pet_drag_x_bounds),窗口留白允许悬出屏外。
     fn clamp_inside_screen(&self, x: i32, y: i32, h: i32) -> (i32, i32) {
-        unsafe {
-            let (lo, hi) = pet_drag_x_bounds(self.pet_size().0, self.pet_offset_x());
-            let nx = x.clamp(lo, hi);
-            let (lo, hi) = pet_drag_y_bounds(h);
-            let ny = y.clamp(lo.min(hi), lo.max(hi));
-            (nx, ny)
-        }
+        let (lo, hi) = pet_drag_x_bounds(self.pet_size().0, self.pet_offset_x());
+        let nx = x.clamp(lo, hi);
+        let (lo, hi) = pet_drag_y_bounds(h);
+        let ny = y.clamp(lo.min(hi), lo.max(hi));
+        (nx, ny)
     }
 
     fn toggle_avoid(&mut self) {
@@ -1334,7 +1455,165 @@ impl App {
         }
     }
 
+    /// 清空多源堆叠状态(模式离开 Working/Thinking、堆叠开关关闭时)。
+    /// 下个 tick 由对应路径重建;卡池清空即恢复单源气泡显示。
+    fn clear_stack(&mut self) {
+        if self.stack_state.is_empty() && self.stack_pool.is_empty() && self.stack_cache.is_empty()
+        {
+            return;
+        }
+        self.stack_state.clear();
+        self.stack_pool.clear();
+        self.stack_cache.clear();
+        self.dirty_request = true;
+    }
+
+    /// 多源堆叠气泡(Working/Thinking,bubble.stack 开启):
+    /// - 轮流显示跨所有源(source=None 的 rotate_pick 选前排会话),前排卡
+    ///   驻留逻辑与单源一致:内容静默 ≥ bubble.rotate_ms 才交给下一个候选;
+    ///   所有源都在活跃输出时前排卡不动。
+    /// - stack_cards 判定每源出卡(出现/消失滞后)与顺序(非前排按注册序、
+    ///   前排固定末位、上限 4 张)。
+    /// - 每卡内容 bubble_text_pinned(Some(src), …):前排卡带打字机 reveal,
+    ///   非前排卡 lines 清空(只画头部);标题按源纠正(全局 mode 只反映
+    ///   最高优先级)。
+    /// - 卡片 layout 进池(stack_pool),文本与几何都没变时零开销;有变化
+    ///   置 dirty。旧的单源 bubble widget 置空。
+    fn update_stack_bubble(
+        &mut self,
+        snap: &Snapshot,
+        effective: Mode,
+        tick_now: u64,
+        dt: u64,
+        type_cps: u32,
+        max_chars: usize,
+    ) {
+        // 前排卡驻留:跨源的 rotate_pick + 内容变更重置静默计时
+        let stale = self
+            .bubble_stale_since
+            .map(|at| tick_now.saturating_sub(at) >= self.cfg.bubble.rotate_ms.max(1))
+            .unwrap_or(false);
+        let pick = bubble_text::rotate_pick(snap, None, effective, self.bubble_pick.as_deref(), stale);
+        if pick != self.bubble_pick {
+            self.bubble_pick = pick.clone();
+            self.bubble_stale_since = Some(tick_now);
+        }
+        let prefer = self.bubble_pick.as_deref();
+        // 前排会话所属源(前排卡固定显示它的流式内容)
+        let front_src: Option<dshpet::state::Source> = prefer.and_then(|sid| {
+            snap.working
+                .iter()
+                .chain(&snap.thinking)
+                .find(|s| s.session_id == sid)
+                .map(|s| s.source)
+        });
+        // 打字机 reveal 只推进前排卡(前排会话不存在时不追踪任何流)
+        let pos = if type_cps > 0 {
+            let stream = front_src.and_then(|_| bubble_text::live_stream_pinned(snap, front_src, effective, prefer));
+            let same = match (&self.reveal, &stream) {
+                (Some((sid, kind, _)), Some(s)) => *sid == s.session_id && *kind == s.kind,
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                self.reveal = stream.as_ref().map(|s| (s.session_id.clone(), s.kind, 0.0));
+            }
+            match (&mut self.reveal, &stream) {
+                (Some((_, _, pos)), Some(s)) => {
+                    *pos += type_cps as f32 * dt as f32 / 1000.0;
+                    let p = (*pos as usize).min(s.len);
+                    if s.len.saturating_sub(p) > TYPE_LAG_CHARS {
+                        *pos = (s.len - TYPE_LAG_CHARS) as f32;
+                    }
+                    Some(p)
+                }
+                _ => None,
+            }
+        } else {
+            self.reveal = None;
+            None
+        };
+        // 前排卡文字(带 prefer 固定到轮换会话);无前排 = 空
+        let front_text = front_src.map(|src| {
+            let mut t = bubble_text::bubble_text_pinned(snap, Some(src), prefer, pos, max_chars);
+            bubble_stack::fix_card_title(&mut t, snap, src);
+            t
+        });
+        let new_text = front_text.clone().unwrap_or_default();
+        if new_text != self.bubble_text {
+            // a changed message resets the staleness timer
+            self.bubble_stale_since = Some(tick_now);
+            self.bubble_text = new_text;
+            self.dirty_request = true;
+        }
+        // 出卡判定(滞后/排序/截断)+ 卡池同步
+        let cards = bubble_stack::stack_cards(snap, prefer, tick_now, &mut self.stack_state);
+        let keep: BTreeSet<u16> = cards.iter().map(|c| c.id).collect();
+        let pool_before: BTreeSet<u16> = self.stack_pool.keys().copied().collect();
+        self.stack_pool.retain(|id, _| keep.contains(id));
+        if pool_before != keep {
+            // 卡片消失(滞留期到)/新增:compose 的级联集合变了,必须重绘
+            self.dirty_request = true;
+        }
+        // 每卡按当前 pet 尺寸重排;级联占位(下层卡向右下偏移)会压缩可用
+        // 高度,按卡数预留,保证前排卡下缘不越过本体(窗口不长大)
+        let pet_w = self.pet_size().0;
+        let pet_h = self.pet_size().1;
+        let dpi = self.comp.dpi_scale();
+        let reserve = (cards.len().saturating_sub(1)) as u32 * bubble::scaled(bubble::STACK_OFFSET_Y, dpi);
+        let pet_h_stack = pet_h.saturating_sub(reserve);
+        let theme = self.bubble.theme.clone();
+        for card in &cards {
+            let entry = self.stack_pool.entry(card.id).or_insert_with(|| {
+                (bubble::Bubble { theme: theme.clone(), ..Default::default() }, tick_now)
+            });
+            let mut t = if card.front {
+                front_text.clone().unwrap_or_default()
+            } else {
+                let mut t = bubble_text::bubble_text_pinned(
+                    snap,
+                    Some(dshpet::state::Source::Script(card.id)),
+                    None,
+                    None,
+                    max_chars,
+                );
+                t.lines.clear(); // 非前排卡只画头部(From 药丸 + 状态标题)
+                t
+            };
+            bubble_stack::fix_card_title(&mut t, snap, dshpet::state::Source::Script(card.id));
+            if entry.0.layout(t, pet_w, pet_h_stack, &self.comp) {
+                self.dirty_request = true;
+            }
+        }
+        self.stack_cache = cards;
+        // 每卡 200ms 淡入期间保持重绘(淡入走 appear 系数,若无内容变化置
+        // dirty,淡入会停在第一帧)
+        if self
+            .stack_pool
+            .values()
+            .any(|(_, appeared)| tick_now.saturating_sub(*appeared) < 200)
+        {
+            self.dirty_request = true;
+        }
+        // 旧的单源 bubble widget 置空(堆叠期由卡池接管 compose 绘制)
+        let cleared = self.bubble.layout(bubble_text::BubbleText::default(), 0, 0, &self.comp);
+        if cleared {
+            self.dirty_request = true;
+        }
+    }
+
+    /// 托盘「多源堆叠显示」勾选切换:写回 config.json,清空堆叠状态,
+    /// 下个 tick 按新开关走对应路径,立即生效,重启保持。
+    fn toggle_stack(&mut self) {
+        self.cfg.bubble.stack = !self.cfg.bubble.stack;
+        let _ = self.cfg.save(&self.exe_dir().join("config.json"));
+        self.clear_stack();
+        self.dirty_request = true;
+        log_line(&format!("[bubble] stack toggle -> {}", self.cfg.bubble.stack));
+    }
+
     fn compose(&mut self) {
+        let compose_t0 = std::time::Instant::now();
         let (pet_w, pet_h) = self.pet_size();
         // 自动收起:身体被任务栏盖住的部分留透明(任务栏从透明区透出)
         self.comp.clip_bottom = if self.collapsed { self.collapse_clip } else { 0 };
@@ -1378,12 +1657,27 @@ impl App {
         // the phone bubble is composited BEFORE the pet sprite, so the
         // enlarged bubble may be partially occluded by the body — the pet
         // naturally covers whatever overlaps it (可以被本体遮挡一部分)。
-        if self.bubble.visible() {
-            // 右缘 = 动图宽 × BUBBLE_RIGHT_FRACTION(与窗口 layout 同一公式,
-            // 加上本体让位偏移与滑入动画)。
-            let bx = pet_x + bx_rel.round() as i32 + ((1.0 - self.bubble_fade) * 8.0) as i32; // 从宠物方向滑入
-            let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
-            self.bubble.draw(&mut self.comp, bx, by, self.mode, self.bubble_fade);
+        // 多源堆叠:stack_cache(后→前,末位 = 前排卡)依次级联绘制,第 i 张
+        // 卡偏移 (i×STACK_OFFSET_X, i×STACK_OFFSET_Y);只有一张卡时与单源
+        // 现状完全一致(同位置、同内容、show_body=true)。
+        let bx = pet_x + bx_rel.round() as i32 + ((1.0 - self.bubble_fade) * 8.0) as i32; // 从宠物方向滑入
+        let by = bubble::scaled(bubble::BUBBLE_MARGIN_Y, dpi) as i32;
+        // 鼠标穿透悬浮:气泡(单源/堆叠)随本体一起压到 hover_opacity
+        let dim = self.bubble_hover_dim.clamp(0.05, 1.0);
+        if self.cfg.bubble.stack && !self.stack_cache.is_empty() {
+            let ox = bubble::scaled(bubble::STACK_OFFSET_X, dpi) as i32;
+            let oy = bubble::scaled(bubble::STACK_OFFSET_Y, dpi) as i32;
+            let now = now_ms();
+            let n = self.stack_cache.len();
+            for (i, card) in self.stack_cache.iter().enumerate() {
+                let Some((b, appeared)) = self.stack_pool.get(&card.id) else { continue };
+                // 每卡出现时 200ms 淡入,再乘悬浮变暗系数
+                let appear = ((now.saturating_sub(*appeared) as f32 / 200.0).clamp(0.0, 1.0) * dim).clamp(0.0, 1.0);
+                let m = if card.working { Mode::Working } else { Mode::Thinking };
+                b.draw(&mut self.comp, bx + i as i32 * ox, by + i as i32 * oy, m, appear, i + 1 == n);
+            }
+        } else if self.bubble.visible() {
+            self.bubble.draw(&mut self.comp, bx, by, self.mode, self.bubble_fade * dim, true);
         }
 
         // 本体方向光投影(演示方案 3):偏移 (3,3)px、模糊 12px、α 40%
@@ -1430,6 +1724,25 @@ impl App {
             }
         }
         self.comp.present();
+        // 耗时打点(限频 5s 一行):实测 1/2/4 卡流式帧耗时,验证堆叠的
+        // 缓存放大器(LRU 文字块 + 阴影几何缓存)是否达标
+        {
+            static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = now_ms();
+            let last = LAST_LOG.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 5000
+                && LAST_LOG
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let ms = compose_t0.elapsed().as_secs_f32() * 1000.0;
+                log_line(&format!(
+                    "[compose] {ms:.1} ms cards={} stack={}",
+                    self.stack_cache.len(),
+                    self.cfg.bubble.stack
+                ));
+            }
+        }
     }
 
     /// Dragging is always allowed (reposition the pet anytime); the MOVE
@@ -1509,13 +1822,25 @@ impl App {
     pub fn show_tray_menu(&mut self) {
         if let Some(t) = &self.tray {
             let scripts = self.script_menu_entries();
-            if let Some(cmd) = t.show_menu(self.cfg.avoid.enabled, self.cfg.auto_hide.enabled, &scripts) {
+            if let Some(cmd) = t.show_menu(
+                self.cfg.avoid.enabled,
+                self.cfg.auto_hide.enabled,
+                self.cfg.autostart,
+                self.cfg.bubble.stack,
+                self.cfg.click_through.enabled,
+                self.cfg.sound.enabled,
+                &scripts,
+            ) {
                 match cmd {
                     tray::MENU_QUIT => unsafe {
                         PostQuitMessage(0);
                     },
                     tray::MENU_AVOID_TOGGLE => self.toggle_avoid(),
                     tray::MENU_AUTOHIDE_TOGGLE => self.toggle_auto_hide(),
+                    tray::MENU_AUTOSTART_TOGGLE => self.toggle_autostart(),
+                    tray::MENU_STACK_TOGGLE => self.toggle_stack(),
+                    tray::MENU_CLICKTHROUGH_TOGGLE => self.toggle_click_through(),
+                    tray::MENU_SOUND_TOGGLE => self.toggle_sound(),
                     tray::MENU_ENDPOINTS => settings::open_settings(self),
                     c if c >= tray::MENU_SCRIPT_BASE => self.toggle_script(c - tray::MENU_SCRIPT_BASE),
                     _ => {}

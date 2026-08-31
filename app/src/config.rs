@@ -21,9 +21,28 @@ pub struct Config {
     pub text: TextConfig,
     pub windows: WindowConfig,
     pub avoid: AvoidConfig,
+    /// 鼠标穿透(WS_EX_TRANSPARENT):所有鼠标操作直接落到下层界面,
+    /// 光标悬浮在宠物上时压低不透明度(hover_opacity)以透视下层。
+    pub click_through: ClickThroughConfig,
     /// Saved window position (pet's last dragged spot). None = default anchor.
     pub window_pos: WindowPosConfig,
+    /// 状态提示音:done/failed/attention 触发时播放 resource/ 下的 wav。
+    pub sound: SoundConfig,
     pub autostart: bool,
+}
+
+/// 状态提示音配置:托盘右键「提示音」可即时切换并写回 config.json。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundConfig {
+    /// 总开关(默认开;关掉后三种状态音都不播)。
+    pub enabled: bool,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        SoundConfig { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +120,15 @@ pub struct BubbleConfig {
     /// Typewriter speed: live text reveals N characters per second
     /// (0 = instant, current behavior).
     pub type_cps: u32,
+    /// 多源堆叠显示(托盘「多源堆叠显示」可即时切换并写回):Working/Thinking
+    /// 时每个有活动会话的接入口一张级联卡,前排卡显示流式内容,其余卡只露
+    /// 头部(From 药丸 + 状态标题)。默认 true(与部署配置一致);
+    /// false = 单源气泡轮流显示。
+    pub stack: bool,
+    /// 轮流显示驻留时长(ms):前排卡/气泡的内容静默超过该时长才交给下一个
+    /// 候选会话;内容持续更新(活跃输出)时永不轮换。单源模式的轮流显示
+    /// 共用此配置。
+    pub rotate_ms: u64,
     /// 气泡主题(浅色/深色预设 + 覆盖项 + 状态色)。
     pub theme: BubbleThemeConfig,
 }
@@ -113,6 +141,8 @@ impl Default for BubbleConfig {
             exempt_from_fade: true,
             font_scale: 1.0,
             type_cps: 90,
+            stack: true,
+            rotate_ms: crate::bubble_text::DEFAULT_ROTATE_MS,
             theme: BubbleThemeConfig::default(),
         }
     }
@@ -390,11 +420,11 @@ impl Default for AvoidConfig {
 /// 自动下移到任务栏区域(y = 屏幕高度 − y_factor × 窗口高度,任务栏自然盖住
 /// 下半身)、透明度进一步降低、鼠标点击穿透;有新消息(状态离开
 /// idle/offline)或鼠标悬停超过 `hover_sec` 秒后恢复原位与不透明度。
-/// 仅用窗口样式与位置实现,无额外权限/依赖。
+/// 仅用窗口样式与位置实现,无额外权限/依赖。默认开启。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoHideConfig {
-    /// 总开关(托盘右键「自动收起」可即时切换并写回)。
+    /// 总开关(默认 true;托盘右键「自动收起」可即时切换并写回)。
     pub enabled: bool,
     /// idle/offline 持续多少秒后收起。
     pub after_sec: u64,
@@ -411,13 +441,36 @@ pub struct AutoHideConfig {
 impl Default for AutoHideConfig {
     fn default() -> Self {
         AutoHideConfig {
-            enabled: false,
+            enabled: true,
             after_sec: 30,
             y_factor: 0.4,
             opacity: 0.3,
             hover_sec: 3,
             slide_speed: 600.0,
         }
+    }
+}
+
+/// 鼠标穿透(click-through):勾选后窗口加 WS_EX_TRANSPARENT,宠物不再
+/// 拦截任何鼠标操作,点击/滚轮全部落到下层界面;穿透后窗口收不到鼠标
+/// 消息,悬浮检测改用光标位置轮询(与自动收起的悬停检测同一方案)。光标
+/// 悬浮在宠物上时把不透明度压到 `hover_opacity`(默认 0.1,即透明度 90%,
+/// 本体与气泡一起变透明,可透视看到下层界面),移开后恢复原透明度。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClickThroughConfig {
+    /// 总开关(默认关:全新安装的宠物开箱可正常点击,需要时从托盘右键
+    /// 「鼠标穿透」开启并写回)。
+    pub enabled: bool,
+    /// 光标悬浮在宠物上时的不透明度(0.05–1.0,进渐隐 lerp,本体与气泡
+    /// 统一生效)。0.1 = 透明度 90%(可透视下层);注意本字段是
+    /// "不透明度",越小越透。
+    pub hover_opacity: f32,
+}
+
+impl Default for ClickThroughConfig {
+    fn default() -> Self {
+        ClickThroughConfig { enabled: false, hover_opacity: 0.1 }
     }
 }
 
@@ -458,9 +511,9 @@ impl Default for ScriptEntryConfig {
     }
 }
 
-/// 出厂默认接入口:DSH + Hermes(与迁移前的内置默认行为一致——没有 config.json
-/// 时自动生成的配置也会监控 DSH 与 Hermes)。MAA/ComfyUI 由随包发布的
-/// config.json 注册,不进默认(裸配置不该去连不存在的程序)。
+/// 出厂默认接入口:DSH + Hermes + MAA + ComfyUI,与随包发布的 config.json
+/// 保持一致(没有 config.json 时自动生成的配置同样注册这四个来源;目标
+/// 程序不存在时对应脚本会把该源标记为不健康,不影响其它源与宠物本体)。
 fn default_scripts() -> Vec<ScriptEntryConfig> {
     vec![
         ScriptEntryConfig {
@@ -484,6 +537,30 @@ fn default_scripts() -> Vec<ScriptEntryConfig> {
                 "db_path": null, // null = 自动解析(env HERMES_WEB_UI_HOME → 用户主目录)
                 "poll_ms_active": 1000,
                 "poll_ms_idle": 2000
+            })),
+            sandbox: false,
+            enabled: true,
+            debug: false,
+        },
+        ScriptEntryConfig {
+            name: "MAA".into(),
+            file: "scripts/maa.lua".into(),
+            poll_ms: 1000,
+            args: Some(serde_json::json!({
+                "log": "D:\\MeoAssistantArknights\\debug\\gui.log",
+                "attention_ms": 3000
+            })),
+            sandbox: false,
+            enabled: true,
+            debug: false,
+        },
+        ScriptEntryConfig {
+            name: "ComfyUI".into(),
+            file: "scripts/comfyui.lua".into(),
+            poll_ms: 2000,
+            args: Some(serde_json::json!({
+                "url": "http://127.0.0.1:8188",
+                "timeout_ms": 3000
             })),
             sandbox: false,
             enabled: true,
@@ -520,12 +597,16 @@ impl Default for Config {
                 exempt_from_fade: true,
                 font_scale: 1.0,
                 type_cps: 90,
+                stack: true,
+                rotate_ms: crate::bubble_text::DEFAULT_ROTATE_MS,
                 theme: BubbleThemeConfig::default(),
             },
             text: TextConfig::default(),
             windows: WindowConfig { done_sec: 10, fail_sec: 10, celebrate_sec: 4 },
             avoid: AvoidConfig::default(),
+            click_through: ClickThroughConfig::default(),
             window_pos: WindowPosConfig::default(),
+            sound: SoundConfig::default(),
             autostart: false,
         }
     }
@@ -606,19 +687,29 @@ mod tests {
         assert_eq!(c2.fade.fade_disabled_states, vec!["attention".to_string()]);
         assert_eq!(c2.bubble.type_cps, 90);
         assert!((c2.bubble.font_scale - 1.0).abs() < 1e-6);
+        // 多源堆叠默认开(与部署配置一致);rotate_ms 默认 = 原 ROTATE_AFTER_MS 硬编码值
+        assert!(c2.bubble.stack);
+        assert_eq!(c2.bubble.rotate_ms, 5000);
         assert_eq!(c2.windows.done_sec, 10);
-        // auto_hide (自动收起) defaults OFF;slide_speed sane
-        assert!(!c2.auto_hide.enabled);
+        // auto_hide (自动收起) defaults ON;slide_speed sane
+        assert!(c2.auto_hide.enabled);
         assert_eq!(c2.auto_hide.after_sec, 30);
         assert!((c2.auto_hide.slide_speed - 600.0).abs() < 1e-6);
         // avoid (回避模式) defaults to OFF with sane tuning
         assert!(!c2.avoid.enabled);
         assert!((c2.avoid.distance - 190.0).abs() < 1e-6);
         assert!((c2.avoid.hysteresis - 1.6).abs() < 1e-6);
+        // click_through (鼠标穿透) defaults OFF;hover 悬浮时不透明度 0.1(透视 90%)
+        assert!(!c2.click_through.enabled);
+        assert!((c2.click_through.hover_opacity - 0.1).abs() < 1e-6);
         // old configs without the avoid section parse to the same default
         let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
         assert!(old.avoid.enabled == false && old.avoid.shift > 0.0);
         assert!((old.avoid.return_speed - 700.0).abs() < 1e-6);
+        // 旧配置(无 click_through 段)自动回退默认:穿透关、悬浮透视 0.1
+        let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
+        assert!(!old.click_through.enabled);
+        assert!((old.click_through.hover_opacity - 0.1).abs() < 1e-6);
         // text section: only the stream char window remains (behind-the-pet
         // renderer and its styling were removed)
         assert_eq!(c2.text.max_chars, 1200);
@@ -628,6 +719,15 @@ mod tests {
         // old configs without a text section must not break
         let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
         assert_eq!(old.text.max_chars, 1200);
+        // 旧配置(无 stack/rotate_ms 字段)自动回退默认:堆叠开、驻留 5s
+        let old: Config = serde_json::from_str(r#"{"bubble":{"throttle_ms":150}}"#).unwrap();
+        assert!(old.bubble.stack);
+        assert_eq!(old.bubble.rotate_ms, 5000);
+        // 新字段显式配置可解析(rotate_ms 提为配置项,单源轮流共用)
+        let newer: Config =
+            serde_json::from_str(r#"{"bubble":{"stack":true,"rotate_ms":8000}}"#).unwrap();
+        assert!(newer.bubble.stack);
+        assert_eq!(newer.bubble.rotate_ms, 8000);
         // a config with the removed behind-mode fields still parses (ignored)
         let b: Config = serde_json::from_str(r#"{"text":{"mode":"behind","outline_width":2}}"#).unwrap();
         assert_eq!(b.text.max_chars, 1200);
@@ -696,17 +796,24 @@ mod tests {
 
     #[test]
     fn scripts_defaults_and_roundtrip() {
-        // 出厂默认:DSH + Hermes(自动生成的配置开箱即监控它们)
+        // 出厂默认:DSH + Hermes + MAA + ComfyUI(与随包发布的 config.json 一致)
         let c = Config::default();
         let names: Vec<&str> = c.scripts.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["DSH", "Hermes"]);
+        assert_eq!(names, ["DSH", "Hermes", "MAA", "ComfyUI"]);
         assert_eq!(c.scripts[0].file, "scripts/dsh.lua");
         assert_eq!(c.scripts[1].file, "scripts/hermes.lua");
-        assert!(c.scripts[0].enabled && c.scripts[1].enabled);
+        assert_eq!(c.scripts[2].file, "scripts/maa.lua");
+        assert_eq!(c.scripts[3].file, "scripts/comfyui.lua");
+        assert!(c.scripts.iter().all(|s| s.enabled && !s.sandbox && !s.debug));
+        assert_eq!(
+            c.scripts[2].args.as_ref().unwrap()["log"],
+            "D:\\MeoAssistantArknights\\debug\\gui.log"
+        );
+        assert_eq!(c.scripts[3].args.as_ref().unwrap()["url"], "http://127.0.0.1:8188");
         // 旧配置/部分配置没写 scripts 段 → 同样补上默认接入口(开箱即监控
-        // DSH/Hermes,与迁移前的行为一致);显式 "scripts":[] 则尊重(用户可关)
+        // 四个来源,与随包 config.json 一致);显式 "scripts":[] 则尊重(用户可关)
         let old: Config = serde_json::from_str(r#"{"dsh":{"url":"http://x"}}"#).unwrap();
-        assert_eq!(old.scripts.len(), 2, "missing scripts field fills from Config::default()");
+        assert_eq!(old.scripts.len(), 4, "missing scripts field fills from Config::default()");
         let explicit: Config = serde_json::from_str(r#"{"scripts":[]}"#).unwrap();
         assert!(explicit.scripts.is_empty());
         // 注册项解析(name/file/poll_ms/args/sandbox)与默认值

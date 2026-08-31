@@ -1,4 +1,8 @@
--- hermes.lua v1 — Hermes 连接器(由内置 Rust 连接器 connectors/hermes.rs 迁移为外源脚本)
+-- hermes.lua v2 — Hermes 连接器(由内置 Rust 连接器 connectors/hermes.rs 迁移为外源脚本)
+--
+-- v2 修复(相对 v1):WAL 副本回退只复制一次,之后永远读启动时刻的快照,
+--   状态会永久冻结。现在每 60s 重试直连(恢复即切回),仍失败则按原库大小
+--   变化/超时重新复制,保证轮询数据跟着 Hermes 前进。
 --
 -- 行为与旧内置连接器一致:只读轮询 Hermes 的 SQLite 数据库(sessions/messages)。
 --   sessions 表:ended_at=NULL 且 last_active 新鲜(10 分钟内)→ running;翻转发
@@ -156,11 +160,20 @@ local function copy_file(src, dst)
 end
 
 local active_db
-local function open_db()
-  -- 直接只读打开
-  local ok, _ = pcall(pet.sqlite, db_path, "SELECT 1")
-  if ok then return db_path end
-  -- 回退:复制 db+wal+shm 到临时目录再读(仅非沙箱)
+local using_copy = false -- true = 在读临时副本(原库直连失败,如 WAL/shm 权限)
+local copy_size, copy_at = nil, 0 -- 副本对应的原库大小/复制时刻(刷新判据)
+
+-- 原库当前大小(刷新判据;沙箱下无 io → nil,不刷新)
+local function orig_size()
+  if not (io and os) then return nil end
+  local f = io.open(db_path, "rb")
+  if not f then return nil end
+  local s = f:seek("end")
+  f:close()
+  return s
+end
+
+local function copy_to_tmp()
   if not (io and os and os.getenv) then return nil end
   local tmpbase = os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
   local dir = tmpbase .. "/dshpet-hermes-" .. tostring(os.time()) .. "-" .. tostring(math.random(10000, 99999))
@@ -172,6 +185,16 @@ local function open_db()
   end
   if not copied then return nil end
   return dir .. "/hermes-web-ui.db"
+end
+
+local function open_db()
+  -- 直接只读打开
+  local ok, _ = pcall(pet.sqlite, db_path, "SELECT 1")
+  if ok then return db_path, false end
+  -- 回退:复制 db+wal+shm 到临时目录再读(仅非沙箱)
+  local p = copy_to_tmp()
+  if p then return p, true end
+  return nil, false
 end
 
 -- ---- 会话轮询 ----
@@ -408,17 +431,46 @@ local function poll_once()
 end
 
 -- ---- 主循环 ----
-active_db = open_db()
+active_db, using_copy = open_db()
 if not active_db then
   pet.health(false)
   pet.log("error", "hermes db unavailable: " .. (db_path or "(unresolved)"))
   return -- 源下线(日志可见原因)
 end
 
-pet.log("info", "hermes.lua v1 watching " .. active_db .. " (active " .. poll_ms_active .. "ms, idle " .. poll_ms_idle .. "ms)")
+pet.log("info", "hermes.lua v2 watching " .. active_db .. " (active " .. poll_ms_active .. "ms, idle " .. poll_ms_idle .. "ms)")
+
+-- 副本保鲜:临时副本是启动时刻的快照,一直读它状态会永久冻结。每 60s 试一次
+-- 直连(权限恢复即切回);仍不行则按"原库大小变化 或 超 10 分钟"重新复制,
+-- 保证轮询读到的数据跟着 Hermes 前进。
+local next_direct_check = os.time() + 60
+if using_copy then
+  copy_size = orig_size()
+  copy_at = os.time()
+  pet.log("info", "direct open failed, using tmp copy (will refresh)")
+end
 
 local healthy = false
 while true do
+  if using_copy and os.time() >= next_direct_check then
+    next_direct_check = os.time() + 60
+    local okd = pcall(pet.sqlite, db_path, "SELECT 1")
+    if okd then
+      active_db = db_path
+      using_copy = false
+      pet.log("info", "direct db open recovered; dropping tmp copy")
+    else
+      local size = orig_size()
+      if size ~= copy_size or os.time() - copy_at >= 600 then
+        local p = copy_to_tmp()
+        if p then
+          active_db = p
+          copy_size, copy_at = size, os.time()
+          pet.log("info", "refreshed wal copy -> " .. p)
+        end
+      end
+    end
+  end
   local ok, any = pcall(poll_once)
   if ok then
     if not healthy then

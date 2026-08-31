@@ -382,7 +382,7 @@ fn load_compact_sheet(
             let mut alpha = vec![0u8; iw * ih];
             for row in 0..ih {
                 for col in 0..iw {
-                    let src = ((sy as usize + row) * sheet_w as usize + sx as usize + col);
+                    let src = (sy as usize + row) * sheet_w as usize + sx as usize + col;
                     let key = (raw[src * 4], raw[src * 4 + 1], raw[src * 4 + 2]);
                     let dst = row * iw + col;
                     idx[dst] = lookup[&key];

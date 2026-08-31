@@ -166,6 +166,8 @@ end
 local current = nil
 local queued = -1
 local max_hist_tries = 12
+local fail_streak = 0 -- /queue 连续失败次数(服务不可达时中性收尾 current 用)
+local FAIL_STREAK_END = 5 -- 连续失败达到该轮数(默认 2s 轮询 ≈10s)即收尾
 
 pet.health(true)
 pet.log("info", "comfyui v2.1 watching " .. base .. " (poll " .. poll .. "ms)")
@@ -176,9 +178,20 @@ while true do
   if not ok then
     pet.health(false)
     pet.log("error", tostring(q))
+    fail_streak = fail_streak + 1
+    -- 服务持续不可达:current 的 tool/session 事件永远等不到配对收尾,
+    -- 宠物会被钉在 Working。按 aborted 中性收尾;服务恢复后若任务仍在跑,
+    -- 同一 prompt 会重新走 session_started(宿主侧已按 turn 幂等,安全)
+    if current and fail_streak >= FAIL_STREAK_END then
+      pet.tool_ended(current, "run", false)
+      pet.session_ended(current, 1, "aborted")
+      pet.log("info", "run end " .. current .. " -> aborted (server unreachable)")
+      current = nil
+    end
     pet.wait(poll)
   else
     pet.health(true)
+    fail_streak = 0
     local running = q.queue_running or {}
     local r = running and running[1]
     if first then

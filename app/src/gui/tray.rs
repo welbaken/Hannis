@@ -1,6 +1,6 @@
 //! Tray icon (Shell_NotifyIcon): prefers the `icon.png`-derived HICON,
 //! falls back to a runtime-drawn circle when no PNG is available.
-//! Right-click menu: 回避模式 (checkable) / 退出.
+//! Right-click menu: 回避模式 / 自动收起 / 多源堆叠显示 / 鼠标穿透 / 开机自启 (checkable) + 接入口 / 退出.
 
 use super::window::{instance, WM_APP_TRAY};
 use windows::core::{w, PCWSTR};
@@ -17,6 +17,16 @@ pub const MENU_AVOID_TOGGLE: usize = 1002;
 pub const MENU_AUTOHIDE_TOGGLE: usize = 1003;
 /// 打开"接入口设置"窗口(启停 / 参数如 log 位置、IP 及端口)。
 pub const MENU_ENDPOINTS: usize = 1004;
+/// Toggle 开机自启:同步 config.autostart 与 HKCU Run 注册表项。
+pub const MENU_AUTOSTART_TOGGLE: usize = 1005;
+/// Toggle 多源堆叠显示(bubble.stack):Working/Thinking 时每个有活动
+/// 会话的接入口一张级联卡,前排卡显示流式内容。
+pub const MENU_STACK_TOGGLE: usize = 1006;
+/// Toggle 鼠标穿透(WS_EX_TRANSPARENT):所有鼠标操作穿透到下层界面,
+/// 悬浮在宠物上时宠物近乎透明(可透视下层)。
+pub const MENU_CLICKTHROUGH_TOGGLE: usize = 1007;
+/// Toggle 提示音(SoundConfig.enabled):done/failed/attention 状态音。
+pub const MENU_SOUND_TOGGLE: usize = 1008;
 /// 接入口子菜单里第 i 个脚本的启停项 id = MENU_SCRIPT_BASE + i。
 pub const MENU_SCRIPT_BASE: usize = 1100;
 
@@ -110,14 +120,19 @@ impl Tray {
         self.added = false;
     }
 
-        /// Show the right-click menu at the cursor; returns the chosen id.
-    /// `avoid_enabled` / `auto_hide_enabled` control the checkmarks so the
-    /// current states are visible before the user picks anything.
+    /// Show the right-click menu at the cursor; returns the chosen id.
+    /// `avoid_enabled` / `auto_hide_enabled` / `autostart_enabled` /
+    /// `stack_enabled` / `click_through_enabled` / `sound_enabled` control the
+    /// checkmarks so the current states are visible before the user picks anything.
     /// `scripts`: (启用?, 显示名) 列表,渲染"接入口"子菜单的启停项。
     pub fn show_menu(
         &self,
         avoid_enabled: bool,
         auto_hide_enabled: bool,
+        autostart_enabled: bool,
+        stack_enabled: bool,
+        click_through_enabled: bool,
+        sound_enabled: bool,
         scripts: &[(bool, String)],
     ) -> Option<usize> {
         unsafe {
@@ -131,6 +146,18 @@ impl Tray {
             let hide_flags: MENU_ITEM_FLAGS =
                 if auto_hide_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, hide_flags, MENU_AUTOHIDE_TOGGLE, w!("自动收起"));
+            let stack_flags: MENU_ITEM_FLAGS =
+                if stack_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, stack_flags, MENU_STACK_TOGGLE, w!("多源堆叠显示"));
+            let ct_flags: MENU_ITEM_FLAGS =
+                if click_through_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, ct_flags, MENU_CLICKTHROUGH_TOGGLE, w!("鼠标穿透"));
+            let snd_flags: MENU_ITEM_FLAGS =
+                if sound_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, snd_flags, MENU_SOUND_TOGGLE, w!("提示音"));
+            let auto_flags: MENU_ITEM_FLAGS =
+                if autostart_enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, auto_flags, MENU_AUTOSTART_TOGGLE, w!("开机自启"));
             // 接入口子菜单:每脚本一个勾选项(点击=启停切换)
             if !scripts.is_empty() {
                 let sub = CreatePopupMenu().unwrap_or(HMENU::default());

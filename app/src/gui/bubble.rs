@@ -36,13 +36,12 @@ pub const BUBBLE_RIGHT_FRACTION: f32 = 0.25;
 pub const MAX_BUBBLE_W: u32 = 150;
 pub const MIN_BUBBLE_W: u32 = 150;
 pub const MAX_BUBBLE_H: u32 = 350;
-/// Force a minimum height so even short content keeps the phone-screen
-/// (taller-than-wide) silhouette instead of collapsing into a landscape
-/// pill.
-///pub const MIN_BUBBLE_H: u32 = 374;
-pub const MIN_BUBBLE_H: u32 = 350;
-/// How transparent the white fill is (0 = invisible, 255 = opaque).
-pub const FILL_ALPHA: u8 = 80;
+/// 多源堆叠级联偏移(按 DPI 缩放):第 i 张卡(后→前)相对第一张的
+/// 偏移 = (i × STACK_OFFSET_X, i × STACK_OFFSET_Y),下层卡向右下偏移,
+/// 只露头部;前排卡(最后一张)完整显示流式内容。
+/// 350 + 3×44 ≈ 482px,4 张装得进可用高度,窗口不长大。
+pub const STACK_OFFSET_X: u32 = 12;
+pub const STACK_OFFSET_Y: u32 = 44;
 /// Soft floating shadow (CSS box-shadow style): the blurred halo diffuses
 /// evenly from the card's center — zero offset in both axes
 /// (0px 0px 40px ≈ rgba(0,0,0,.15)). The bubble margins guarantee the halo
@@ -50,22 +49,12 @@ pub const FILL_ALPHA: u8 = 80;
 const SHADOW_OFFSET_X: u32 = 0;
 const SHADOW_OFFSET_Y: u32 = 0;
 const SHADOW_BLUR: u32 = 20;
-const SHADOW_ALPHA: u8 = 38; // ≈ 15% black
-/// 1px light-gray micro border (modern card).
-const BORDER_RGB: (u8, u8, u8) = (205, 205, 205);
-const BORDER_ALPHA: u8 = 190;
-/// Divider line under the header row.
-const DIVIDER_RGB: (u8, u8, u8) = (196, 196, 196);
-const DIVIDER_ALPHA: u8 = 170;
 /// Vertical spacing around the divider (above / line height / below).
 const DIVIDER_GAP_TOP: u32 = 3;
 const DIVIDER_H: u32 = 1;
 const DIVIDER_GAP_BOTTOM: u32 = 4;
 /// Gap between the "From …" pill and the state title row below it.
 const PILL_GAP: u32 = 6;
-/// Header text colors: title dark, "From …" muted gray.
-const TITLE_RGB: (u8, u8, u8) = (0x26, 0x26, 0x26);
-const FROM_RGB: (u8, u8, u8) = (0x8f, 0x8f, 0x8f);
 
 pub(crate) fn scaled(v: u32, s: f32) -> u32 {
     ((v as f32) * s).round().max(1.0) as u32
@@ -217,15 +206,17 @@ impl Bubble {
 
     /// Draw at (x, y): soft floating shadow, 1px light-gray border,
     /// translucent white fill, then the header row (state title left, the
-    /// "From …" pill also left-aligned below it), the divider, and the
-    /// stream. Drawn before the pet sprite, so the body may cover part of it.
+    /// "From …" pill also left-aligned below it); with `show_body` also the
+    /// divider and the stream. 堆叠的非前排卡传 `show_body = false`:只画
+    /// 阴影/边框/填充/头部(跳过分隔线+正文文字合成),下层的前排卡会盖住
+    /// 其余部分。Drawn before the pet sprite, so the body may cover part of it.
     /// Draw at (x+sx, y) with the resolved theme: soft floating shadow,
     /// micro border, translucent fill, a 4px state accent bar on the left,
     /// the header (state title left — colored for done/fail/attention — and
     /// the "From …" source pill at the right), the divider, then the stream.
     /// `appear` (0..1) fades/slides the whole card in (auto-hide transition
     /// friendly). Drawn before the pet sprite, so the body may cover part.
-    pub fn draw(&self, comp: &mut Compositor, x: i32, y: i32, mode: Mode, appear: f32) {
+    pub fn draw(&self, comp: &mut Compositor, x: i32, y: i32, mode: Mode, appear: f32, show_body: bool) {
         let appear = appear.clamp(0.0, 1.0);
         let s = comp.dpi_scale();
         let pad_x = scaled(PAD_X, s);
@@ -353,7 +344,7 @@ impl Bubble {
             appear,
         );
         let _ = ta;
-        if self.text.lines.is_empty() {
+        if !show_body || self.text.lines.is_empty() {
             return;
         }
         // divider under the header row

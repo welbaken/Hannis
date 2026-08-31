@@ -44,33 +44,65 @@ if from > 0 then f:read("*l") end -- 丢弃被截断的半行
 pet.health(true)
 pet.log("info", "watching " .. log_path)
 local started = false
+local last_size = size -- 预扫描后的文件大小(截断/轮转检测基准)
 
 while true do
-  local line = f:read("*l")
-  if line then
-    if stream then pet.live_text(session, { text = line }) end
-    if args.fail and line:find(args.fail, 1, true) then
-      if started then pet.tool_ended(session, tool, true) end
-      pet.session_ended(session, 1, "error")
-      started = false
-    elseif args.done and line:find(args.done, 1, true) then
-      if started then pet.tool_ended(session, tool, false) end
-      pet.session_ended(session, 1, "completed")
-      started = false
-    elseif args.connect and line:find(args.connect, 1, true) then
-      if not started then
-        pet.session_started(session, 1)
-        started = true
-      end
-    elseif args.work and line:find(args.work, 1, true) then
-      if not started then
-        pet.session_started(session, 1)
-        started = true
-      end
-      pet.tool_started(session, tool, nil)
-    end
+  -- 轮转/截断/删除检测(与 maa.lua 同一套):每次先用独立句柄看文件大小。
+  -- 没有它,日志轮转后 f:read 永远 nil,脚本会静默冻结在最后一个状态。
+  local probe = io.open(log_path, "r")
+  if not probe then
+    pet.health(false)
+    pet.log("error", "log disappeared, retrying")
+    pet.wait(cfg.poll_ms or 1000)
   else
-    -- 没有新行:等待(可中断的切片睡眠,不影响程序退出)
+    local cur_size = probe:seek("end")
+    probe:close()
+    pet.health(true)
+    if cur_size < last_size then
+      -- 日志被清空/轮转:进行中的会话中性收尾,从头读新文件
+      if started then
+        pet.tool_ended(session, tool, false)
+        pet.session_ended(session, 1, "aborted")
+        started = false
+      end
+      f:close()
+      f = io.open(log_path, "r")
+      if f then f:seek("set", 0) end
+    end
+    last_size = cur_size
+    if not f then
+      -- 上次重开失败(文件被删):文件重新出现后恢复句柄
+      f = io.open(log_path, "r")
+      if f then f:seek("set", 0) end
+    end
+    if f then
+      -- 排空当前可用的新行再等待(有行时不睡,避免高峰期一行行积压)
+      while true do
+        local line = f:read("*l")
+        if not line then break end
+        if stream then pet.live_text(session, { text = line }) end
+        if args.fail and line:find(args.fail, 1, true) then
+          if started then pet.tool_ended(session, tool, true) end
+          pet.session_ended(session, 1, "error")
+          started = false
+        elseif args.done and line:find(args.done, 1, true) then
+          if started then pet.tool_ended(session, tool, false) end
+          pet.session_ended(session, 1, "completed")
+          started = false
+        elseif args.connect and line:find(args.connect, 1, true) then
+          if not started then
+            pet.session_started(session, 1)
+            started = true
+          end
+        elseif args.work and line:find(args.work, 1, true) then
+          if not started then
+            pet.session_started(session, 1)
+            started = true
+          end
+          pet.tool_started(session, tool, nil)
+        end
+      end
+    end
     pet.wait(cfg.poll_ms or 1000)
   end
 end

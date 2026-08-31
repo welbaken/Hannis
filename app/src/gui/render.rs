@@ -15,7 +15,7 @@
 //! is the correct mode here.
 
 use dshpet::anim::Frame;
-use windows::core::{w, PCWSTR};
+use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -52,9 +52,13 @@ pub struct Compositor {
     /// divider — same sizes, regular and 2×.
     font_bold: HFONT,
     font2_bold: HFONT,
-    /// Cached rasterized text block (1×, premultiplied BGRA with alpha ==
-    /// coverage). Rebuilt only when the key changes, composited per frame.
-    text_cache: Option<TextCache>,
+    /// Cached rasterized text blocks (1×, premultiplied BGRA with alpha ==
+    /// coverage), 8-slot LRU. Stacked cards render ~2-3 text blocks per card
+    /// per frame (pill + title, plus the front card's body): a single-slot
+    /// cache would thrash (every block re-rasterized every frame), the LRU
+    /// keeps them warm so a streaming frame only re-rasterizes the block
+    /// that actually changed.
+    text_cache: Vec<TextCache>,
     /// Scratch buffers reused across re-rasterizations (no realloc on
     /// every typewriter tick).
     cov2: Vec<u8>,
@@ -62,6 +66,10 @@ pub struct Compositor {
     /// Scratch buffers for the soft-shadow blur.
     shadow_cov: Vec<u8>,
     shadow_tmp: Vec<u8>,
+    /// Blurred soft-shadow cache (see [`Compositor::soft_shadow`]): N
+    /// same-geometry cards rasterize + blur once, composite multiplies
+    /// per-card alpha.
+    shadow_cache: Option<ShadowCache>,
     /// Global alpha applied to the next composite_block(draw_text_alpha 用)。
     raster_alpha: f32,
     /// 窗口屏幕原点(软件亚克力截屏坐标用;compose 时更新)。
@@ -173,6 +181,21 @@ struct TextCache {
     bgra: Vec<u8>,
 }
 
+/// LRU slot count for rasterized text blocks: 4 stacked cards × (pill +
+/// title; same-state titles share one entry) + the front card's body fits.
+const TEXT_CACHE_SLOTS: usize = 8;
+
+/// Blurred soft-shadow cache: N same-geometry cards (every stacked card has
+/// identical w/h/radius/blur) rasterize + blur ONCE; the composite multiplies
+/// per-card alpha over the shared blurred coverage. Key = geometry.
+struct ShadowCache {
+    key: (u32, u32, u32, u32, i32, i32),
+    pad: usize,
+    bw: usize,
+    bh: usize,
+    cov: Vec<u8>,
+}
+
 impl Compositor {
     pub fn new(hwnd: HWND, font_scale: f32) -> Compositor {
         let screen_dc = unsafe { GetDC(HWND::default()) };
@@ -278,11 +301,12 @@ impl Compositor {
             font2,
             font_bold,
             font2_bold,
-            text_cache: None,
+            text_cache: Vec::new(),
             cov2: Vec::new(),
             col2: Vec::new(),
             shadow_cov: Vec::new(),
             shadow_tmp: Vec::new(),
+            shadow_cache: None,
             raster_alpha: 1.0,
             screen_pos: (0, 0),
             acrylic_cache: None,
@@ -484,6 +508,9 @@ impl Compositor {
     /// as black at `alpha` (0..=255). The halo extends `blur` px beyond
     /// the shape on every side, so it visibly diffuses up/left too when
     /// the blur exceeds the offset.
+    ///
+    /// 性能放大器(堆叠卡的前提):模糊覆盖度按几何 (w, h, radius, blur,
+    /// dx, dy) 缓存 —— N 张同尺寸卡只光栅化+模糊一次,合成时各自乘 alpha。
     pub fn soft_shadow(
         &mut self,
         x: i32,
@@ -503,44 +530,54 @@ impl Compositor {
         let pad = (blur + dx.max(0) as i64 + dy.max(0) as i64) as usize;
         let bw = w as usize + pad * 2;
         let bh = h as usize + pad * 2;
-        self.shadow_cov.resize(bw * bh, 0);
-        self.shadow_tmp.resize(bw * bh, 0);
-        let cov = &mut self.shadow_cov;
-        // rasterize the rounded-rect shape (hard edge; the blur softens it).
-        // Every pixel is written, so stale data from a previous size never
-        // leaks into the halo.
-        let (sx0, sy0) = (pad as i64 + dx as i64, pad as i64 + dy as i64);
-        let r = radius as i64;
-        let r2 = r * r;
-        let cx_lo = sx0 + r;
-        let cx_hi = (sx0 + w as i64 - 1 - r).max(cx_lo);
-        let cy_lo = sy0 + r;
-        let cy_hi = (sy0 + h as i64 - 1 - r).max(cy_lo);
-        for row in 0..bh {
-            let yy = row as i64;
-            let cy = yy.clamp(cy_lo, cy_hi);
-            let dyy = yy - cy;
-            for col in 0..bw {
-                let xx = col as i64;
-                let cx = xx.clamp(cx_lo, cx_hi);
-                let dxx = xx - cx;
-                cov[row * bw + col] = if dxx * dxx + dyy * dyy <= r2 { 255 } else { 0 };
+        let key = (w, h, radius, blur as u32, dx, dy);
+        let hit = matches!(
+            &self.shadow_cache,
+            Some(c) if c.key == key && c.bw == bw && c.bh == bh
+        );
+        if !hit {
+            // 复用旧缓存的分配(尺寸相同)或重新分配;形状逐像素全覆盖
+            // 写入,旧数据不会漏进 halo
+            let mut cov = match self.shadow_cache.take() {
+                Some(c) if c.cov.len() == bw * bh => c.cov,
+                _ => vec![0u8; bw * bh],
+            };
+            self.shadow_tmp.resize(bw * bh, 0);
+            let (sx0, sy0) = (pad as i64 + dx as i64, pad as i64 + dy as i64);
+            let r = radius as i64;
+            let r2 = r * r;
+            let cx_lo = sx0 + r;
+            let cx_hi = (sx0 + w as i64 - 1 - r).max(cx_lo);
+            let cy_lo = sy0 + r;
+            let cy_hi = (sy0 + h as i64 - 1 - r).max(cy_lo);
+            for row in 0..bh {
+                let yy = row as i64;
+                let cy = yy.clamp(cy_lo, cy_hi);
+                let dyy = yy - cy;
+                for col in 0..bw {
+                    let xx = col as i64;
+                    let cx = xx.clamp(cx_lo, cx_hi);
+                    let dxx = xx - cx;
+                    cov[row * bw + col] = if dxx * dxx + dyy * dyy <= r2 { 255 } else { 0 };
+                }
             }
-        }
-        // two separable box-blur iterations ≈ Gaussian falloff
-        let br = (blur / 2).max(1) as usize;
-        {
-            let (cov, tmp) = (&mut self.shadow_cov, &mut self.shadow_tmp);
-            for _ in 0..2 {
-                box_blur_h(cov, bw, bh, br, tmp);
-                box_blur_v(tmp, bw, bh, br, cov);
+            // two separable box-blur iterations ≈ Gaussian falloff
+            let br = (blur / 2).max(1) as usize;
+            {
+                let tmp = &mut self.shadow_tmp[..bw * bh];
+                for _ in 0..2 {
+                    box_blur_h(&cov, bw, bh, br, tmp);
+                    box_blur_v(tmp, bw, bh, br, &mut cov);
+                }
             }
+            self.shadow_cache = Some(ShadowCache { key, pad, bw, bh, cov });
         }
         // composite: black at cov*alpha over the window buffer (clipped).
         // The blurred coverage is read through a raw pointer so the window
         // buffer can be borrowed mutably below (same pattern as the text
         // cache composite).
-        let cov_ptr = self.shadow_cov.as_ptr();
+        let cache = self.shadow_cache.as_ref().unwrap();
+        let (cov_ptr, bw, bh, pad) = (cache.cov.as_ptr(), cache.bw, cache.bh, cache.pad);
         let a = alpha as u32;
         let ox = x - pad as i32;
         let oy = y - pad as i32;
@@ -781,48 +818,43 @@ impl Compositor {
         }
     }
 
-    /// Draw text lines inside (x, y, w, h): 2× supersampled GDI
-    /// rasterization, cached, composited with correct per-pixel coverage
-    /// (see [`Compositor::raster_text`]). `fill` is the text color
-    /// (r, g, b); `right` right-aligns the lines inside the rect; `bold`
-    /// renders with the weight-700 font (bubble header row).
-    pub fn draw_text(&mut self, x: i32, y: i32, w: u32, h: u32, lines: &[String], fill: (u8, u8, u8), right: bool, bold: bool) {
-        self.draw_text_alpha(x, y, w, h, lines, fill, right, bold, false, 1.0)
-    }
-
     /// `alpha`(0..1)整体缩放文字的预乘颜色与覆盖度(气泡淡入/淡出用)。
     /// `single` = 不换行绘制(来源药丸用;DT_SINGLELINE,避免 GDI 在
     /// 恰好等宽的边界上把词组换行)。
     pub fn draw_text_alpha(&mut self, x: i32, y: i32, w: u32, h: u32, lines: &[String], fill: (u8, u8, u8), right: bool, bold: bool, single: bool, alpha: f32) {
         if w == 0 || h == 0 || lines.is_empty() {
-            self.text_cache = None;
             return;
         }
         let style = CacheStyle::Plain { fill, right, bold, single };
-        self.raster_text(w, h, lines, style);
+        let idx = self.raster_text(w, h, lines, style);
         let scale = alpha.clamp(0.0, 1.0);
         self.raster_alpha = scale;
         let (ptr, cw, ch) = {
-            let c = self.text_cache.as_ref().unwrap();
+            let c = &self.text_cache[idx];
             (c.bgra.as_ptr(), c.w, c.h)
         };
         self.composite_block(x, y, ptr, cw, ch);
     }
 
-    /// Rasterize `lines` into the cached 1× text block (premultiplied
-    /// BGRA, alpha == coverage) when the cache key changed.
+    /// Rasterize `lines` into a cached 1× text block (premultiplied
+    /// BGRA, alpha == coverage) when no cached slot matches; returns the
+    /// slot index (LRU: a hit moves its slot to the front, a miss inserts
+    /// at the front and evicts the oldest beyond TEXT_CACHE_SLOTS).
     ///
     /// Supersampling: every GDI pass runs at 2× resolution into the 2×
     /// text DIB, then the coverage/color planes are box-filtered down to
     /// 1×. The 2×→1× average is a 4-tap AA filter, so glyph edges come
     /// out smoother and more solid than a single native pass — the cheap
     /// "render big, shrink" contrast trick.
-    fn raster_text(&mut self, w: u32, h: u32, lines: &[String], style: CacheStyle) {
+    fn raster_text(&mut self, w: u32, h: u32, lines: &[String], style: CacheStyle) -> usize {
         let key = CacheKey { lines: lines.to_vec(), w, h, style };
-        if let Some(c) = &self.text_cache {
-            if c.key == key {
-                return;
+        if let Some(i) = self.text_cache.iter().position(|c| c.key == key) {
+            if i != 0 {
+                // LRU touch: move the hit slot to the front (most recent)
+                let hit = self.text_cache.remove(i);
+                self.text_cache.insert(0, hit);
             }
+            return 0;
         }
         let right = match &key.style {
             CacheStyle::Plain { right, .. } => *right,
@@ -913,7 +945,9 @@ impl Compositor {
                 block.extend_from_slice(&[cb, cg, cr, fa]);
             }
         }
-        self.text_cache = Some(TextCache { key, w, h, bgra: block });
+        self.text_cache.insert(0, TextCache { key, w, h, bgra: block });
+        self.text_cache.truncate(TEXT_CACHE_SLOTS);
+        0
     }
 
     /// Composite the cached text block (premultiplied BGRA, alpha ==
@@ -1171,18 +1205,7 @@ impl Compositor {
             .unwrap_or(false)
     }
 
-    /// Measure the pixel width of one line (1× font; for pills/tags).
-    pub fn text_width(&self, text: &str) -> u32 {
-        unsafe {
-            let _ = SelectObject(self.dc, self.font);
-            let wide: Vec<u16> = text.encode_utf16().collect();
-            let mut size = SIZE::default();
-            let _ = GetTextExtentPoint32W(self.dc, &wide, &mut size);
-            size.cx.max(0) as u32
-        }
-    }
-
-    /// 与 `text_width` 相同但用粗体(来源胶囊等粗体文字的宽度测量)。
+    /// Measure the pixel width of one line (1× bold font; for pills/tags).
     pub fn text_width_bold(&self, text: &str) -> u32 {
         unsafe {
             let _ = SelectObject(self.dc, self.font_bold);

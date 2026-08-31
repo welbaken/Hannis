@@ -6,8 +6,10 @@ use crate::state::{Mode, SessionInfo, Snapshot, Source};
 pub const MAX_LINE: usize = 120;
 
 /// 轮流显示: how long a bubble message may stay unchanged before the pet
-/// hands the bubble to another session that has content.
-pub const ROTATE_AFTER_MS: u64 = 5000;
+/// hands the bubble to another session that has content. Now a config value
+/// (`bubble.rotate_ms`, shared by the single-source rotation and the stacked
+/// front card); this constant is only its default.
+pub const DEFAULT_ROTATE_MS: u64 = 5000;
 
 /// Structured bubble content: a header row (state title left, "From
 /// <client>" right-aligned), a 1px divider, and the message stream below
@@ -112,8 +114,9 @@ fn best_of<'a>(cands: &[&'a SessionInfo], snap: &Snapshot) -> Option<&'a Session
 }
 
 /// 轮流显示: keep `current` while its message keeps changing; once it has
-/// been static for ROTATE_AFTER_MS (`stale`) and another session has content,
-/// hand the bubble over to that session. Returns the session id to show.
+/// been static for the rotate dwell (`stale`) and another session has
+/// content, hand the bubble over to that session. Returns the session id to
+/// show.
 pub fn rotate_pick(
     snap: &Snapshot,
     source: Option<Source>,
@@ -557,9 +560,9 @@ mod tests {
     #[test]
     fn idle_shows_pending_queue() {
         let mut s = snap(Mode::Idle);
-        crate::state::register_script_label(0, "ComfyUI".to_string());
+        crate::state::register_script_label(9, "ComfyUI".to_string());
         s.queue_len = 3;
-        let b = bt(&s, Some(Source::Script(0)));
+        let b = bt(&s, Some(Source::Script(9)));
         assert_eq!(b.title, "休息中 💤");
         assert_eq!(b.from.as_deref(), Some("ComfyUI"));
         assert!(b.lines[0].contains("3"));
@@ -709,9 +712,9 @@ mod tests {
     #[test]
     fn bubble_text_idle_has_from() {
         let mut s = snap(Mode::Idle);
-        crate::state::register_script_label(0, "ComfyUI".to_string());
+        crate::state::register_script_label(9, "ComfyUI".to_string());
         s.queue_len = 3;
-        let b = bubble_text_pinned(&s, Some(Source::Script(0)), None, None, MAX_LINE);
+        let b = bubble_text_pinned(&s, Some(Source::Script(9)), None, None, MAX_LINE);
         assert_eq!(b.title, "休息中 💤");
         assert_eq!(b.from.as_deref(), Some("ComfyUI"));
         assert!(b.lines[0].contains("3"));

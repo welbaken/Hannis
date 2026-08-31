@@ -2,6 +2,7 @@
 //! config, connectors). GUI lives in `gui` (Windows only).
 
 pub mod anim;
+pub mod bubble_stack;
 pub mod bubble_text;
 pub mod config;
 pub mod connectors;

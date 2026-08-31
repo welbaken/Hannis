@@ -200,6 +200,15 @@ struct SessionState {
     last_user_text: Option<String>,
     waiting_user: bool,
     last_end: Option<(TurnEndReason, u64)>,
+    /// running=false 连续起点(持续 not-running 的账目清理防抖用)。
+    not_running_since: Option<u64>,
+    /// 最近一次出现在 ok=true 的 poll 快照里的时刻;消失回收([`PetState`]
+    /// 的 SESSION_VANISH_GRACE_MS)以此为基准。
+    last_poll_seen: Option<u64>,
+    /// 已记账且尚未收尾的回合号。turn/start 幂等判重用:脚本轮询重放、
+    /// 丢帧补发常造成同一 turn 的重复 session_started,旧实现只增不减会
+    /// 把会话永久钉在 Thinking。turn==0(脚本未编号)无法判重,保持旧语义。
+    open_turns: BTreeSet<u64>,
     todos: Vec<TodoItem>,
     live: LiveText,
 }
@@ -248,6 +257,16 @@ fn truncate_chars(s: &str, n: usize) -> String {
 }
 
 pub const TTL_APPROVAL_MS: u64 = 30 * 60 * 1000;
+/// running=false 的"补记完成"防抖窗口:有打开回合的会话在 running 抖回
+/// false 时,须持续 not-running 超过该时长才认定回合结束;瞬时抖动由下一条
+/// running=true 取消,防止进行中的会话被反复误报成"任务完成"。
+pub const DONE_FALLBACK_DEBOUNCE_MS: u64 = 3000;
+/// Poll 快照里"会话消失"后的回收宽限。快照是全量基线:一个会话连续超过该
+/// 时长不再出现,说明它真的没了(被删除/服务端重启丢失)——即便其回合/工具
+/// 账目仍开着也必须回收,否则陈旧账目没有任何事件再来翻转,会把宠物永久
+/// 钉在 Thinking。只对"进过快照"的会话生效(从未被 poll 报告过的会话没有
+/// 消失判定的基准,仍按原有规则处理)。
+pub const SESSION_VANISH_GRACE_MS: u64 = 60 * 1000;
 pub const DEFAULT_DONE_MS: u64 = 120 * 1000;
 pub const DEFAULT_FAIL_MS: u64 = 10 * 1000;
 /// Guaranteed top-priority window right after a done/fail event, so the
@@ -326,44 +345,43 @@ impl PetState {
         match ev {
             StateEvent::SourceHealth { source, healthy } => {
                 self.source_health.insert(source, healthy);
+                if !healthy {
+                    // 源下线:它的会话账目(running/turns/tools)从此不再有事件
+                    // 来翻转——最后一次快照留下的"运行中"只可能是陈旧值,不清
+                    // 掉会把宠物钉死在 Working/Thinking(不健康的源不参与
+                    // all_sources_down 之外的任何模式判定,同理这里也不该让它
+                    // 驱动模式)。title/todo/last_end 时间窗是元数据,保留;
+                    // 源恢复后 poll/事件会重建真实账目。
+                    for s in self.sessions.values_mut() {
+                        if s.source == source {
+                            s.running = false;
+                            s.turns = 0;
+                            s.tools.clear();
+                            s.tool_args.clear();
+                            s.tool_since.clear();
+                            s.open_turns.clear();
+                            s.not_running_since = None;
+                        }
+                    }
+                }
             }
             StateEvent::Poll { source, items, ok, .. } => {
                 if !ok {
                     return;
                 }
                 let now = self.now_ms;
-                let mut any_done = false;
                 let mut seen = BTreeSet::new();
                 for it in items {
                     seen.insert(it.session_id.clone());
                     let s = self.session_mut(source, &it.session_id);
+                    s.last_poll_seen = Some(now);
                     if it.title.is_some() {
                         s.title = it.title;
                     }
                     if let Some(todos) = it.todos {
                         s.todos = todos;
                     }
-                    if !it.running {
-                        // running true->false without an explicit turn/end (push gap):
-                        // done fallback, unless the session is waiting on the user.
-                        let recently_ended = s
-                            .last_end
-                            .map(|(_, at)| now.saturating_sub(at) < 10_000)
-                            .unwrap_or(false);
-                        if (s.turns > 0 || !s.tools.is_empty()) && !s.waiting_user && !recently_ended {
-                            s.last_end = Some((TurnEndReason::Completed, now));
-                            any_done = true;
-                        }
-                        s.turns = 0;
-                        s.tools.clear();
-                        s.tool_since.clear();
-                        s.running = false;
-                    } else {
-                        s.running = true;
-                    }
-                }
-                if any_done {
-                    self.done_sound_pending = true;
+                    self.set_session_running(source, &it.session_id, it.running, now);
                 }
                 // reap inactive sessions that vanished from their source's poll
                 let keep: Vec<String> = self
@@ -375,6 +393,16 @@ impl PetState {
                         }
                         if seen.contains(*id) {
                             return true;
+                        }
+                        // 消失超过宽限:即便账目仍 active 也回收(见
+                        // SESSION_VANISH_GRACE_MS 注释——账目开着却没有事件再
+                        // 来翻转,是"会话已不存在"的唯一稳定信号)
+                        let vanished_long_ago = s
+                            .last_poll_seen
+                            .map(|at| now.saturating_sub(at) >= SESSION_VANISH_GRACE_MS)
+                            .unwrap_or(false);
+                        if vanished_long_ago {
+                            return false;
                         }
                         // drop only if fully inactive and past the done window
                         let ended_long_ago = s
@@ -389,39 +417,42 @@ impl PetState {
             }
             StateEvent::SessionStatus { source, session_id, running } => {
                 let now = self.now_ms;
-                let mut any_done = false;
-                {
-                    let s = self.session_mut(source, &session_id);
-                    s.running = running;
-                    if !running {
-                        let recently_ended = s
-                            .last_end
-                            .map(|(_, at)| now.saturating_sub(at) < 10_000)
-                            .unwrap_or(false);
-                        if (s.turns > 0 || !s.tools.is_empty()) && !s.waiting_user && !recently_ended {
-                            s.last_end = Some((TurnEndReason::Completed, now));
-                            any_done = true;
-                        }
-                        s.turns = 0;
-                        s.tools.clear();
-                        s.tool_since.clear();
-                    }
-                }
-                if any_done {
-                    self.done_sound_pending = true;
-                }
+                self.set_session_running(source, &session_id, running, now);
             }
-            StateEvent::TurnStarted { source, session_id, .. } => {
+            StateEvent::TurnStarted { source, session_id, turn } => {
                 let s = self.session_mut(source, &session_id);
+                // turn/start 幂等:同一回合的重复开始(脚本重放/补发)只记一次
+                // 账。回合收尾后(turn/end 已到)同号回合重新开始是合法的新
+                // 周期(tail_log 等脚本复用 session id + 固定 turn 号),不受影响。
+                if turn > 0 && !s.open_turns.insert(turn) {
+                    return;
+                }
                 s.turns += 1;
                 s.waiting_user = false;
                 s.running = true;
             }
-            StateEvent::TurnEnded { source, session_id, reason, .. } => {
+            StateEvent::TurnEnded { source, session_id, turn, reason, .. } => {
                 let now = self.now_ms;
                 let (done, fail, blocked) = {
                     let s = self.session_mut(source, &session_id);
-                    s.turns = s.turns.saturating_sub(1);
+                    // turn>0 且从未记账(重复/乱序的 end)不减账:否则一个多余
+                    // 的 end 会提前关掉别的回合。turn==0(脚本未编号)无法配对,
+                    // 保持旧的饱和递减语义。
+                    let was_open = turn > 0 && s.open_turns.remove(&turn);
+                    if turn == 0 || was_open {
+                        s.turns = s.turns.saturating_sub(1);
+                    }
+                    // turn 结束 = 本轮执行结束,running 必须复位,否则结束后
+                    // 会话永远"running",mode() 永远回不到 Idle(done/失败
+                    // 窗口过期后宠物不休息)。会话若还有后续轮次,由
+                    // session_status / 下一轮 session_started(或 poll)置回。
+                    s.running = false;
+                    // 回合结束同时关闭该回合的工具账目:丢帧(result 未送达)
+                    // 泄漏的工具名会让会话永远 Working,再被 running 抖动
+                    // 反复误报成"完成"
+                    s.tools.clear();
+                    s.tool_args.clear();
+                    s.tool_since.clear();
                     s.last_end = Some((reason, now));
                     match reason {
                         TurnEndReason::Blocked => s.waiting_user = true,
@@ -543,6 +574,38 @@ impl PetState {
             .or_insert_with(|| SessionState { source, ..Default::default() })
     }
 
+    /// running 翻转的统一落账(poll 基线与 session-status 推送共用)。
+    ///
+    /// running=true:会话在跑,清除 not-running 防抖(瞬时抖动到此取消)。
+    /// running=false 且回合看似打开(turns>0 或有工具)时:**不补记完成** ——
+    /// 完成信号只认 turn/end 事件(history/mux 按 seq 增量+宽限轮询保证
+    /// 送达,丢帧会在恢复后补上)。这里只做账目清理:持续 not-running
+    /// 超过 [`DONE_FALLBACK_DEBOUNCE_MS`] 确认不是抖动后,清空回合/工具
+    /// 账目让宠物回归 Idle。曾经的"补记 completed"在服务器卡顿抖动下
+    /// 会给进行中/早已结束的会话反复误报"任务完成",已废除。
+    fn set_session_running(&mut self, source: Source, session_id: &str, running: bool, now: u64) {
+        let s = self.session_mut(source, session_id);
+        if running {
+            s.running = true;
+            s.not_running_since = None;
+            return;
+        }
+        s.running = false;
+        if (s.turns > 0 || !s.tools.is_empty()) && !s.waiting_user {
+            // 回合还开着:进入/延续防抖,保住回合账目等 turn/end 补送达
+            let since = *s.not_running_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DONE_FALLBACK_DEBOUNCE_MS {
+                s.turns = 0;
+                s.tools.clear();
+                s.tool_since.clear();
+                s.open_turns.clear();
+                s.not_running_since = None;
+            }
+        } else {
+            s.not_running_since = None;
+        }
+    }
+
     pub fn queue_len(&self) -> u32 {
         self.queue_pending.values().sum()
     }
@@ -584,7 +647,12 @@ impl PetState {
         if self.sessions.values().any(|s| !s.tools.is_empty()) {
             return Mode::Working;
         }
-        if self.sessions.values().any(|s| s.turns > 0) {
+        // running 会话:来源(DSH session.list 轮询 / host-session-status /
+        // Hermes DB 轮询)报告"会话执行中"但还没有 turn/tool 事件(turn 事件
+        // 依赖 mux 事件流,断连时 poll 是唯一激活信号)→ 按思考中处理。
+        // 漏掉它会让"源已激活"时宠物保持 Idle:收起不自动恢复、动画/气泡
+        // 都不反应。
+        if self.sessions.values().any(|s| s.turns > 0 || s.running) {
             return Mode::Thinking;
         }
         let done = self.sessions.values().any(|s| {
@@ -660,7 +728,9 @@ impl PetState {
                 snap.done.push(info);
             } else if !s.tools.is_empty() {
                 snap.working.push(info);
-            } else if s.turns > 0 {
+            } else if s.turns > 0 || s.running {
+                // running 无 turn/tool 事件也会话仍算活跃(见 mode() 注释),
+                // 进思考列表:气泡有"思考中"卡,堆叠/轮流有候选
                 snap.thinking.push(info);
             }
         }
@@ -685,7 +755,7 @@ impl PetState {
                 continue;
             }
             let active = self.sessions.values().any(|s| {
-                s.source == source && (s.turns > 0 || !s.tools.is_empty() || s.waiting_user)
+                s.source == source && (s.running || s.turns > 0 || !s.tools.is_empty() || s.waiting_user)
             });
             let level: u8 = if active { 2 } else { 1 };
             let better = match best {
@@ -755,6 +825,65 @@ mod tests {
         });
         assert_eq!(p.mode(), Mode::Attention);
         p.apply(StateEvent::ApprovalResolved { source: Source::Script(0), id: "ap1".into() });
+        assert_eq!(p.mode(), Mode::Working);
+    }
+
+    #[test]
+    fn running_session_flips_mode_and_snapshot() {
+        // 收起恢复的根因修复:来源只报 running(poll 基线 / session-status,
+        // 无 turn/tool 事件)时,会话也算活跃 —— 模式离开 Idle(收起才肯
+        // 自动恢复)、快照进 thinking 列表、气泡源按"活跃"计
+        let mut p = base();
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", true)],
+            ok: true,
+            error: None,
+        });
+        assert_eq!(p.mode(), Mode::Thinking);
+        let snap = p.snapshot();
+        assert_eq!(snap.thinking.len(), 1);
+        assert_eq!(snap.thinking[0].session_id, "s1");
+        assert!(snap.working.is_empty() && snap.done.is_empty() && snap.failed.is_empty());
+        assert_eq!(p.select_bubble_source(), Some(Source::Script(0)));
+        // 会话停止(running=false,无 turn 记录):直接回 Idle,不进 done 窗口
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", false)],
+            ok: true,
+            error: None,
+        });
+        assert_eq!(p.mode(), Mode::Idle);
+        assert!(p.snapshot().thinking.is_empty());
+    }
+
+    #[test]
+    fn session_status_running_flips_mode() {
+        let mut p = base();
+        p.apply(StateEvent::SessionStatus {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            running: true,
+        });
+        assert_eq!(p.mode(), Mode::Thinking);
+        // false → Idle;有工具时仍是 Working(优先级不变)
+        p.apply(StateEvent::SessionStatus {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            running: false,
+        });
+        assert_eq!(p.mode(), Mode::Idle);
+        p.apply(StateEvent::SessionStatus {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            running: true,
+        });
+        p.apply(StateEvent::ToolStarted {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            name: "bash".into(),
+            arguments: None,
+        });
         assert_eq!(p.mode(), Mode::Working);
     }
 
@@ -937,19 +1066,80 @@ mod tests {
     }
 
     #[test]
-    fn poll_running_false_is_done_fallback() {
+    fn running_false_clears_ledger_never_fakes_done() {
+        // 回归:push 缺口(push 缺口来源没发 turn/end)不再"补记完成" ——
+        // 补记会在服务器卡顿抖动下给进行中/早已结束的会话反复误报
+        // "任务完成"。现在:持续 not-running 只清回合/工具账目,回归 Idle;
+        // 完成提示只由真实 turn/end(Completed) 事件触发。
         let mut p = base();
         p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
         p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "bash".into(), arguments: None });
         assert_eq!(p.mode(), Mode::Working);
-        // push gap: no turn/end event, poll flips to stopped
         p.apply(StateEvent::Poll {
             source: Source::Script(0),
             items: vec![poll_item("s1", false)],
             ok: true,
             error: None,
         });
-        assert_eq!(p.mode(), Mode::Done);
+        assert_eq!(p.mode(), Mode::Working); // 防抖中:账目保留
+        p.now_ms += DONE_FALLBACK_DEBOUNCE_MS;
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", false)],
+            ok: true,
+            error: None,
+        });
+        // 账目清空 → 回归 Idle;不产生任何"完成"记录
+        assert_eq!(p.mode(), Mode::Idle);
+        let s = p.sessions.get("s1").unwrap();
+        assert!(s.last_end.is_none());
+        assert!(s.tools.is_empty() && s.turns == 0);
+    }
+
+    #[test]
+    fn running_flap_does_not_fake_done() {
+        // 回归:会话进行中 running 瞬时抖动 false->true,不得反复误报
+        // "任务完成"(本会话的完成提示反复出现的根因)
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "bash".into(), arguments: None });
+        // 抖动:false 一拍
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", false)],
+            ok: true,
+            error: None,
+        });
+        assert_ne!(p.mode(), Mode::Done);
+        // 恢复:true 取消防抖,不产生任何完成记录
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", true)],
+            ok: true,
+            error: None,
+        });
+        let s = p.sessions.get("s1").unwrap();
+        assert!(s.last_end.is_none());
+        assert_eq!(p.mode(), Mode::Working);
+        // 长时间静默后真正停止:防抖到期清账回归 Idle,依旧不产生"完成"
+        p.now_ms += DONE_FALLBACK_DEBOUNCE_MS;
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", false)],
+            ok: true,
+            error: None,
+        });
+        assert_ne!(p.mode(), Mode::Done); // 防抖重新起算
+        p.now_ms += DONE_FALLBACK_DEBOUNCE_MS;
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", false)],
+            ok: true,
+            error: None,
+        });
+        assert_eq!(p.mode(), Mode::Idle);
+        let s = p.sessions.get("s1").unwrap();
+        assert!(s.last_end.is_none());
     }
 
     #[test]
@@ -1184,5 +1374,111 @@ mod tests {
         p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
         p.apply(StateEvent::SourceHealth { source: Source::Script(1), healthy: false });
         assert_eq!(p.mode(), Mode::Offline);
+    }
+
+    #[test]
+    fn unhealthy_source_stops_driving_mode() {
+        // 源下线后,其最后一次快照留下的"运行中"账目是陈旧值(不再有事件来
+        // 翻转):不得再把宠物钉死在 Working/Thinking。另一源健康 → 不进
+        // Offline,但陈旧账目必须清空。
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::ToolStarted { source: Source::Script(0), session_id: "s1".into(), name: "bash".into(), arguments: None });
+        assert_eq!(p.mode(), Mode::Working);
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: false });
+        assert_ne!(p.mode(), Mode::Working);
+        assert_ne!(p.mode(), Mode::Thinking);
+        assert_ne!(p.mode(), Mode::Offline);
+        let s = p.sessions.get("s1").unwrap();
+        assert!(s.tools.is_empty() && s.turns == 0 && !s.running);
+        // 源恢复:poll 重建真实账目
+        p.apply(StateEvent::SourceHealth { source: Source::Script(0), healthy: true });
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", true)],
+            ok: true,
+            error: None,
+        });
+        assert_eq!(p.mode(), Mode::Thinking);
+    }
+
+    #[test]
+    fn vanished_active_session_reaped_after_grace() {
+        // 会话从快照里消失但回合账目仍开着:宽限内保留(容忍单次快照抖动),
+        // 超过宽限必须回收——否则陈旧账目没有任何事件再来翻转,永久 Thinking
+        let mut p = base();
+        p.apply(StateEvent::Poll {
+            source: Source::Script(0),
+            items: vec![poll_item("s1", true)],
+            ok: true,
+            error: None,
+        });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        assert_eq!(p.mode(), Mode::Thinking);
+        p.now_ms = 1000;
+        p.apply(StateEvent::Poll { source: Source::Script(0), items: vec![], ok: true, error: None });
+        assert!(p.sessions.contains_key("s1"), "宽限内的空快照不得误删");
+        p.now_ms = SESSION_VANISH_GRACE_MS + 1000;
+        p.apply(StateEvent::Poll { source: Source::Script(0), items: vec![], ok: true, error: None });
+        assert!(p.sessions.get("s1").is_none(), "超过宽限必须回收");
+        assert_eq!(p.mode(), Mode::Idle);
+    }
+
+    #[test]
+    fn duplicate_turn_start_is_idempotent() {
+        // 脚本重放同一 turn/start(轮询补发常见):只记一次账;回合收尾后
+        // 同号回合是合法的新周期(tail_log 复用 session id + 固定 turn 号)
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 1);
+        p.apply(StateEvent::TurnEnded {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            turn: 1,
+            reason: TurnEndReason::Completed,
+        });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 0);
+        p.now_ms = DEFAULT_CELEBRATE_MS + 1; // 跳过庆祝窗,避免干扰 mode 断言
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 1 });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 1);
+        assert_eq!(p.mode(), Mode::Thinking);
+    }
+
+    #[test]
+    fn turn_end_without_matching_start_keeps_other_turns() {
+        // 乱序/多余的 turn/end 不得关掉别的回合
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 2 });
+        p.apply(StateEvent::TurnEnded {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            turn: 1,
+            reason: TurnEndReason::Aborted,
+        });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 1);
+        p.apply(StateEvent::TurnEnded {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            turn: 2,
+            reason: TurnEndReason::Aborted,
+        });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 0);
+    }
+
+    #[test]
+    fn turn_zero_events_keep_legacy_balance() {
+        // turn==0(脚本未编号回合)无法判重:保持旧的累加/饱和递减语义
+        let mut p = base();
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 0 });
+        p.apply(StateEvent::TurnStarted { source: Source::Script(0), session_id: "s1".into(), turn: 0 });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 2);
+        p.apply(StateEvent::TurnEnded {
+            source: Source::Script(0),
+            session_id: "s1".into(),
+            turn: 0,
+            reason: TurnEndReason::Aborted,
+        });
+        assert_eq!(p.sessions.get("s1").unwrap().turns, 1);
     }
 }

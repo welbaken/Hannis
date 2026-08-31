@@ -19,22 +19,52 @@ local session = args.session or "proc"
 pet.health(true)
 pet.log("info", "watching process " .. proc)
 local running = false
+local healthy = true
+local unknown_streak = 0
+
+local function set_health(h)
+  if h ~= healthy then
+    healthy = h
+    pet.health(h)
+  end
+end
 
 while true do
   -- 注意:io.popen 在沙箱模式下不可用(sandbox 会移除 io)
-  local pipe = io.popen('tasklist /FI "IMAGENAME eq ' .. proc .. '" /NH 2>nul')
-  local out = pipe and pipe:read("*a") or ""
-  if pipe then pipe:close() end
+  local ok_cmd, pipe = pcall(io.popen, 'tasklist /FI "IMAGENAME eq ' .. proc .. '" /NH 2>nul')
+  local out = ""
+  if ok_cmd and pipe then
+    out = pipe:read("*a") or ""
+    pipe:close()
+  end
 
   local is_running = out:find(proc, 1, true) ~= nil
-  if is_running and not running then
-    pet.session_started(session, 1)
-    pet.tool_started(session, proc, nil)
-    running = true
-  elseif not is_running and running then
-    pet.tool_ended(session, proc, false)
-    pet.session_ended(session, 1, "completed")
-    running = false
+  -- 区分"查询失败"与"进程不在":tasklist 正常运行时总有输出(命中行或
+  -- 本地化的 "INFO: 没有运行的任务…"),输出为空说明命令本身失败了。
+  -- 失败时按未知处理,不能当成"进程消失"误报 done。
+  local known = is_running or out ~= ""
+  if not known then
+    unknown_streak = unknown_streak + 1
+    set_health(false)
+    -- 连续多轮都失败:按中性收尾(源标记不健康;后续恢复会重新探测),
+    -- 避免会话账目悬挂,也避免一次抖动就误报
+    if unknown_streak >= 3 and running then
+      pet.tool_ended(session, proc, false)
+      pet.session_ended(session, 1, "aborted")
+      running = false
+    end
+  else
+    unknown_streak = 0
+    set_health(true)
+    if is_running and not running then
+      pet.session_started(session, 1)
+      pet.tool_started(session, proc, nil)
+      running = true
+    elseif not is_running and running then
+      pet.tool_ended(session, proc, false)
+      pet.session_ended(session, 1, "completed")
+      running = false
+    end
   end
   pet.wait(cfg.poll_ms or 2000)
 end
